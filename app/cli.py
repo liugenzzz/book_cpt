@@ -78,6 +78,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="同 --task，例如 --tasks image_caption,page_ocr_qa。",
     )
     parser.add_argument("--limit-books", type=int, default=None)
+    parser.add_argument(
+        "--recursive",
+        dest="recursive",
+        action="store_true",
+        default=None,
+        help="递归扫描 input-dir 下所有子目录的 PDF。",
+    )
+    parser.add_argument("--no-recursive", dest="recursive", action="store_false", help="只扫描 input-dir 一级目录。")
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="日志级别，默认 INFO；DEBUG 会打出 metric/checkpoint 明细。",
+    )
+    parser.add_argument("--no-progress", dest="progress", action="store_false", default=None, help="关闭进度条。")
+    parser.add_argument("--quiet", action="store_true", help="只显示进度条和错误（等价于 --log-level WARNING）。")
     return parser
 
 
@@ -107,8 +123,28 @@ def main() -> None:
             min_block_text_chars=args.min_block_text_chars,
             task_types=parse_task_specs(args.tasks),
             limit_books=args.limit_books,
+            recursive=args.recursive,
+            log_level="WARNING" if args.quiet else args.log_level,
+            progress=args.progress,
         )
     )
+    skipped = [item for item in results if item.get("skipped")]
+    failed = [item for item in results if item.get("error")]
+    ok = [item for item in results if not item.get("error") and not item.get("skipped")]
+    total_samples = sum(int(item.get("sample_count", 0)) for item in results)
+    print(f"\n完成 {len(ok)}/{len(results)} 本书，样本 {total_samples} 条", file=sys.stderr)
+    if skipped:
+        print(f"跳过 {len(skipped)} 本（文件损坏，已记入 skipped_books.jsonl）:", file=sys.stderr)
+        for item in skipped[:10]:
+            print(f"  - {item.get('book_id')}: {str(item.get('skip_reason'))[:120]}", file=sys.stderr)
+        if len(skipped) > 10:
+            print(f"  ... 另有 {len(skipped) - 10} 本", file=sys.stderr)
+    if failed:
+        print(f"失败 {len(failed)} 本:", file=sys.stderr)
+        for item in failed[:20]:
+            print(f"  - {item.get('book_id')}: {str(item.get('error'))[:160]}", file=sys.stderr)
+        if len(failed) > 20:
+            print(f"  ... 另有 {len(failed) - 20} 本", file=sys.stderr)
     print(json.dumps(results, ensure_ascii=False, indent=2))
 
 

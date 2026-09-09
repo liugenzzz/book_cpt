@@ -21,7 +21,7 @@ def _render_page_worker(args: tuple[str, str, dict[str, Any], int, dict[str, Any
     output_dir = Path(output_dir_text)
     relative = cfg["paths"]["page_images"].format(chapter_no=cfg["default_chapter_no"], page_no=page_no)
     target = output_dir / relative
-    if target.exists():
+    if target.exists() and not bool(cfg["runtime"].get("rerender_pages")):
         return relative, None, "skipped", page_no
 
     scale = float(cfg["render"]["dpi"]) / 72.0
@@ -76,7 +76,9 @@ def render_pages(book: BookRecord, cfg: dict[str, Any]) -> list[str]:
 
     rendered_count = 0
     skipped_count = 0
-    for relative, manifest_row, status, _ in sorted(results, key=lambda item: item[0]):
+    # 按页码排序，不是按相对路径字符串排；路径为空的失败项会被排到最前，
+    # 顺带把 rendered 列表的顺序打乱。
+    for relative, manifest_row, status, _ in sorted(results, key=lambda item: item[3]):
         if relative:
             rendered.append(relative)
         if status == "rendered":

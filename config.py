@@ -118,6 +118,7 @@ CFG = {
     "logger_name": "book_cpt",
     "statuses": {"ready": "ready", "done": "done"},
     "paths": {
+        "skipped_books": "skipped_books.jsonl",
         "manifest": "manifest.jsonl",
         "pages_manifest": "pages/page_index.jsonl",
         "page_images": "images/pages/ch{chapter_no}/p{page_no:03d}.png",
@@ -197,6 +198,14 @@ CFG = {
         "crop_workers": 4,
         "vlm_max_pending": 8,
         "vlm_min_interval_seconds": 0.0,
+        # provider 冷却状态跨进程共享，读缓存的 TTL（秒）。
+        "cooldown_refresh_seconds": 1.0,
+        # 生成阶段每完成多少个 job（或间隔多少秒）打一条带 ETA 的进度日志。
+        "generation_progress_every": 10,
+        "generation_progress_seconds": 60.0,
+        # 断点 checkpoint 攒批落盘的阈值，避免每个 job 都整份重写。
+        "generation_state_flush_every": 20,
+        "generation_state_flush_seconds": 10.0,
         "reuse_mineru": False,
         "reuse_normalized": True,
         "reuse_samples": True,
@@ -204,7 +213,21 @@ CFG = {
         "force_rebuild": False,
         "skip_vlm": False,
         "render_pages": True,
+        # 页面图已存在时默认跳过重渲染；去水印改写了 PDF 时流水线会自动置 True。
+        "rerender_pages": False,
         "crop_blocks": True,
+        "log_level": "INFO",
+        "progress": True,
+    },
+    "watermark": {
+        # 书籍版式比期刊杂，去水印有误删正文可选内容组的风险，默认关闭。
+        # 打开后会把整册重复出现的水印 Form XObject 调用剔掉，另存一份干净 PDF 再送 MinerU。
+        "enabled": False,
+        "form_names": [],
+        "image_sizes": [],
+        "min_page_coverage": 0.6,
+        "cleaned_pdf_path": "preprocessed/{book_id}_cleaned.pdf",
+        "report_path": "preprocessed/watermark_cleaning.json",
     },
     "render": {"dpi": 180, "image_format": "png", "max_side": 2200, "retry_count": 2},
     "crop_filter": {
@@ -248,9 +271,20 @@ CFG = {
         "retry_count": 3,
         "retry_backoff_seconds": 5,
         "retry_backoff_multiplier": 2,
+        "cooldown_seconds": 300,
         "min_content_items": 1,
         "min_page_coverage": 0.8,
         "min_text_chars": 100,
+        # 多实例时在这里逐个列出；每条继承上面的通用配置，只覆盖 url / server_url /
+        # max_concurrency / weight 这类实例相关字段。留空则退回单实例（用上面的 url）。
+        "providers": [
+            {
+                "name": "mineru_1",
+                "url": "http://192.168.78.36:7086",
+                "max_concurrency": 2,
+                "weight": 1,
+            },
+        ],
     },
     "vlm_pool": {
         "strategy": "least_busy_weighted_fallback",

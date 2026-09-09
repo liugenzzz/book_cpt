@@ -123,6 +123,8 @@ python app\cli.py --book "E:\航天\book_cpt\data\飞行员航空知识手册.pd
 - `--mineru-min-page-coverage`：MinerU 解析结果的最小页覆盖率，低于该比例会判定为不完整并重试。
 - `--force-rebuild`：不复用 MinerU 之后的 normalized、samples、exports 缓存，适合清理旧的不完整结果。
 - `--no-reuse-normalized` / `--no-reuse-samples` / `--no-reuse-exports`：分别关闭对应阶段缓存复用。
+- `--recursive` / `--no-recursive`：是否递归扫描 `--input-dir` 下的子目录，默认只扫一级（可在 `config.py` 的 `runtime.recursive` 里改默认值）。
+
 
 示例：
 
@@ -150,6 +152,61 @@ python app\cli.py --book "E:\航天\book_cpt\data\飞行员航空知识手册.pd
 python app\cli.py --input-dir book_cpt\data --output-root book_cpt\outputs --book-workers 3 --mineru-workers 1 --mineru-retry-count 3 --mineru-min-page-coverage 0.8 --page-workers 2 --crop-workers 2 --max-workers 4 --force-rebuild
 ```
 
+### 多实例调度
+
+`config.py` 的 `mineru.providers` 和 `vlm_pool.providers` 都可以配多个实例，调度是抢占式的：谁先空出来谁接下一个任务。
+
+- MinerU 槽位是 `output-root/.runtime/mineru_slots/<provider>/slot_N.lock` 文件锁，跨进程（乃至共享盘上跨主机）都成立；
+  实例连不上时按 `mineru.cooldown_seconds` 进冷却，期间不再往它派活，解析结果不完整则不算实例的锅、不冷却。
+  只配 `mineru.url` 不配 `providers` 时行为与单实例时完全一致。
+- VLM 侧的冷却状态写在 `output-root/.runtime/vlm_cooldown/` 下，多个书籍进程共享；
+  一个实例挂了只需被踩一次，不用每个进程各踩一遍。provider 的 `name` 是冷却文件名，重名会在启动时直接报错。
+- `--book-workers > 1` 时每个子进程各建一份 VlmPool，所以 provider 的 `max_concurrency` 和
+  `min_interval_seconds` 会按进程数自动摊薄，实际压到服务上的并发就是配置里写的那个数。
+
+### 去水印（默认关闭）
+
+`config.py` 的 `watermark.enabled` 打开后，会把整册重复出现（覆盖率超过 `min_page_coverage`）的水印
+Form XObject 调用剔掉，另存一份干净 PDF 再送 MinerU，报告写在 `preprocessed/watermark_cleaning.json`。
+书籍版式比期刊杂，误删正文可选内容组的风险更高，所以默认不开；开启后该书的各级缓存会自动失效重跑。
+即使关闭，损坏 PDF 的检测仍然生效。
+
+## 运行观测
+
+- 进度条：书籍级进度写 stderr，形如 `书籍 [████░░░░] 12/40  30.0% | ✓11 ✗1 | 03:12<07:24 | 飞行员航空知识手册`。
+  重定向到文件或 `nohup` 时（非 TTY）自动退化成每完成一本打一行的 `[进度] ...`，不会往日志里塞回车符。
+  用 `--no-progress` 关掉。
+- 生成阶段进度：单本书内部每完成若干个生成任务打一条带 ETA 的日志
+  （`generate progress book_id=... jobs=37/120 samples=41 failed=0 用时=6.4分 预计剩余=14.3分`），
+  节奏由 `runtime.generation_progress_every` / `generation_progress_seconds` 控制。
+- 日志级别：`--log-level DEBUG|INFO|WARNING|ERROR`（也可用环境变量 `BOOK_CPT_LOG_LEVEL`）。
+  `metric`/`checkpoint` 明细降到了 DEBUG，`--quiet` 等价于 `--log-level WARNING`，只留进度条和错误。
+- 收尾摘要：跑完在 stderr 打一段 `完成 38/40 本，样本 5123 条`，并分别列出跳过和失败的书。
+- 损坏 PDF：pypdf 打不开的文件（截断、加密、结构损坏）算「跳过」不算「失败」，
+  记进 `<output-root>/skipped_books.jsonl`，不会中断整批。
+- 整批生成全失败时抛 `GenerationBatchError`，消息里带 book_id、任务分布和去重后的错误原文，
+  不再静默返回 0 条样本。
+- HTTP 报错不再只说「service unavailable」：401/404/400 会带上状态码、返回体和常见原因提示；
+  连不上（超时、DNS）和「服务端拒绝」是两类不同的错误信息。
+
+## 思维链与 JSON 容错
+
+推理模型默认会输出思维链，服务端没开 reasoning parser 时 `<think>...</think>` 会留在 `content` 里，
+把 JSON 解析整条带偏。现在：
+
+- 每个 provider 默认补 `chat_template_kwargs.enable_thinking=false`（即使它显式写了空的 `chat_template_kwargs`）。
+  确实需要保留思维链的 provider，在 `config.py` 里给它加 `"disable_thinking": false`。
+- 解析前统一剥掉 `<think>`/`<reasoning>` 等成对、只剩闭合标签、被 max_tokens 截断只剩开标签这三种形态；
+  流式和非流式都会跳过 `reasoning_content`。答案整个落在思维链里时直接报错，提示调 `enable_thinking` 或 `max_tokens`。
+- JSON 修复：容忍字符串里的真实换行、补转义非法反斜杠（LaTeX 的 `\alpha`、`\%` 之类）、
+  去掉尾随逗号、`expected_count=1` 时模型返回单个对象而不是数组也能收下。
+
+依赖自检：
+
+```powershell
+python book_cpt\check_deps.py
+```
+
 ## 输出
 
 每本书按独立目录保存：
@@ -167,5 +224,11 @@ python app\cli.py --input-dir book_cpt\data --output-root book_cpt\outputs --boo
 - `exports/sharegpt/{task_type}.jsonl`
 - `exports/alpaca/{task_type}.jsonl`
 - `exports/pt/{task_type}.jsonl`
+- `preprocessed/watermark_cleaning.json`（开启去水印时）
+
+批次级文件写在 `--output-root` 根下：
+
+- `skipped_books.jsonl`：损坏而跳过的 PDF 及原因
+- `.runtime/mineru_slots/`、`.runtime/mineru_cooldown/`、`.runtime/vlm_cooldown/`：多实例调度用的槽位和冷却状态
 
 中间样本保留 `input_payload`、`output_payload`、`evidence` 和 `metadata`，用于从训练样本回溯到原 PDF、页码、块 ID、图片和 MinerU/normalized 结果。

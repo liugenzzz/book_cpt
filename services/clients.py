@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 from ..core.io_utils import maybe_json
+from .cooldown import SharedCooldown, runtime_dir
 
 
 class RequestsClient:
@@ -39,25 +40,71 @@ class MinerUClient(RequestsClient):
         return urlunparse(parsed._replace(path=f"{path}/{route}".replace("//", "/"), params="", query="", fragment=""))
 
     def parse_pdf(self, pdf_path: Path) -> Any:
+        backend = str(self.cfg.get("backend", "pipeline"))
         data: list[tuple[str, str]] = [
-            ("backend", str(self.cfg["backend"])),
-            ("parse_method", str(self.cfg["parse_method"])),
-            ("formula_enable", str(bool(self.cfg["formula_enable"])).lower()),
-            ("table_enable", str(bool(self.cfg["table_enable"])).lower()),
-            ("return_md", str(bool(self.cfg["return_md"])).lower()),
-            ("return_middle_json", str(bool(self.cfg["return_middle_json"])).lower()),
-            ("return_content_list", str(bool(self.cfg["return_content_list"])).lower()),
-            ("return_images", str(bool(self.cfg["return_images"])).lower()),
-            ("response_format_zip", str(bool(self.cfg["response_format_zip"])).lower()),
-            ("return_original_file", str(bool(self.cfg["return_original_file"])).lower()),
+            ("backend", backend),
+            ("parse_method", str(self.cfg.get("parse_method", "auto"))),
+            ("formula_enable", str(bool(self.cfg.get("formula_enable", True))).lower()),
+            ("table_enable", str(bool(self.cfg.get("table_enable", True))).lower()),
+            ("return_md", str(bool(self.cfg.get("return_md", True))).lower()),
+            ("return_middle_json", str(bool(self.cfg.get("return_middle_json", True))).lower()),
+            ("return_content_list", str(bool(self.cfg.get("return_content_list", True))).lower()),
+            ("return_images", str(bool(self.cfg.get("return_images", True))).lower()),
+            ("response_format_zip", str(bool(self.cfg.get("response_format_zip", False))).lower()),
+            ("return_original_file", str(bool(self.cfg.get("return_original_file", False))).lower()),
         ]
-        for lang in self.cfg["lang_list"]:
+        # http-client 后端必须把推理服务地址一并发过去，否则服务端会去读
+        # MINERU_VL_SERVER 环境变量，读不到就抛 ValueError 并以 409 返回。
+        server_url = str(self.cfg.get("server_url", "") or "").strip()
+        if server_url and "http-client" in backend:
+            data.append(("server_url", server_url))
+        for lang in self.cfg.get("lang_list") or ["ch"]:
             data.append(("lang_list", str(lang)))
         with pdf_path.open("rb") as handle:
             files = [("files", (pdf_path.name, handle, "application/pdf"))]
-            response = self.requests.post(self._endpoint("file_parse"), files=files, data=data, timeout=int(self.cfg["timeout"]))
-        response.raise_for_status()
+            response = self.requests.post(
+                self._endpoint("file_parse"),
+                files=files,
+                data=data,
+                timeout=int(self.cfg.get("timeout", 3600)),
+            )
+        if response.status_code >= 400:
+            detail = ""
+            try:
+                detail = str(response.json())[:500]
+            except Exception:
+                detail = response.text[:500]
+            raise RuntimeError(f"MinerU {response.status_code} for {pdf_path.name}: {detail}")
         return response.json()
+
+
+# 除 MinerU 外的推理模型（Qwen3 / DeepSeek-R1 系列等）默认会输出思维链。
+# 服务端开了 reasoning parser 时思维链落在 message.reasoning_content，content 是干净的；
+# 没开 parser 时 <think>...</think> 会原样留在 content 里，必须在解析 JSON 前剥掉。
+_REASONING_TAG = r"think|thinking|reasoning|reason"
+_REASONING_BLOCK_RE = re.compile(rf"<\s*({_REASONING_TAG})\s*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
+_REASONING_CLOSE_RE = re.compile(rf"^.*<\s*/\s*(?:{_REASONING_TAG})\s*>", re.IGNORECASE | re.DOTALL)
+_REASONING_OPEN_RE = re.compile(rf"<\s*(?:{_REASONING_TAG})\s*>", re.IGNORECASE)
+_REASONING_CONTENT_TYPES = {"thinking", "reasoning", "reasoning_content", "redacted_thinking"}
+
+# 关闭思考的默认 chat_template_kwargs；provider 可以显式覆盖具体字段，
+# 或整体设 disable_thinking=False 来保留思维链。
+DEFAULT_CHAT_TEMPLATE_KWARGS: dict[str, Any] = {"enable_thinking": False}
+
+
+def strip_reasoning(text: str) -> str:
+    """剥掉模型输出里的思维链，只保留最终回答。"""
+    if not text:
+        return ""
+    cleaned = _REASONING_BLOCK_RE.sub("", text)
+    # 只有闭合标签（思维链以前缀形式返回，或开标签被模板吃掉）：丢掉最后一个 </think> 之前的所有内容。
+    if _REASONING_CLOSE_RE.search(cleaned):
+        cleaned = _REASONING_CLOSE_RE.sub("", cleaned, count=1)
+    # 只有开标签（输出被 max_tokens 截断）：其后全是思维链，没有可用回答。
+    open_match = _REASONING_OPEN_RE.search(cleaned)
+    if open_match:
+        cleaned = cleaned[: open_match.start()]
+    return cleaned.strip()
 
 
 @dataclass(frozen=True)
@@ -120,16 +167,44 @@ class VlmClient(RequestsClient):
                 time.sleep(delay)
             self._last_request_at = time.monotonic()
 
-    def _extract_message(self, payload: Any) -> str:
-        content = payload["choices"][0].get("message", {}).get("content", "")
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
         if isinstance(content, str):
-            return content.strip()
+            return content
         if isinstance(content, list):
-            return "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict)).strip()
-        return str(content).strip()
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").lower() in _REASONING_CONTENT_TYPES:
+                    continue
+                parts.append(str(item.get("text", "")))
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _finalize_text(self, content: Any, reasoning: Any) -> str:
+        text = strip_reasoning(self._content_to_text(content))
+        if text:
+            return text
+        if str(self._content_to_text(reasoning)).strip():
+            # 回答全部落在思维链里：通常是没关思考且被 max_tokens 截断。
+            raise RuntimeError(
+                f"VLM provider {self.name} returned only reasoning content and no answer "
+                "—— 确认 provider 的 chat_template_kwargs.enable_thinking=False，或调大 max_tokens"
+            )
+        return ""
+
+    def _extract_message(self, payload: Any) -> str:
+        message = payload["choices"][0].get("message", {})
+        if not isinstance(message, dict):
+            message = {}
+        return self._finalize_text(message.get("content", ""), message.get("reasoning_content"))
 
     def _extract_stream(self, response: Any) -> str:
         parts: list[str] = []
+        reasoning_parts: list[str] = []
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -139,11 +214,26 @@ class VlmClient(RequestsClient):
             if not text or text == "[DONE]":
                 continue
             payload = maybe_json(text)
-            if isinstance(payload, dict):
-                choice = payload.get("choices", [{}])[0]
-                delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
-                parts.append(str(delta.get("content", "")) if isinstance(delta, dict) else "")
-        return "".join(parts).strip()
+            if not isinstance(payload, dict):
+                continue
+            choices = payload.get("choices") or [{}]
+            choice = choices[0] if isinstance(choices, list) and choices else {}
+            delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+            if not isinstance(delta, dict):
+                continue
+            parts.append(self._content_to_text(delta.get("content", "")))
+            reasoning_parts.append(self._content_to_text(delta.get("reasoning_content", "")))
+        return self._finalize_text("".join(parts), "".join(reasoning_parts))
+
+    def _chat_template_kwargs(self) -> dict[str, Any]:
+        configured = self.cfg.get("chat_template_kwargs")
+        configured = dict(configured) if isinstance(configured, dict) else {}
+        if not bool(self.cfg.get("disable_thinking", True)):
+            return configured
+        # 显式配置优先，但缺省一律补上关闭思考的字段（空 dict 也要补）。
+        merged = dict(DEFAULT_CHAT_TEMPLATE_KWARGS)
+        merged.update(configured)
+        return merged
 
     def chat(self, prompt: str, images: list[Path] | None = None) -> str:
         content: str | list[dict[str, Any]]
@@ -164,8 +254,8 @@ class VlmClient(RequestsClient):
         }
         if self.cfg.get("max_tokens") is not None:
             payload["max_tokens"] = self.cfg["max_tokens"]
-        template_kwargs = self.cfg.get("chat_template_kwargs")
-        if isinstance(template_kwargs, dict) and template_kwargs:
+        template_kwargs = self._chat_template_kwargs()
+        if template_kwargs:
             payload["chat_template_kwargs"] = template_kwargs
         extra_payload = self.cfg.get("extra_payload")
         if isinstance(extra_payload, dict):
@@ -179,18 +269,38 @@ class VlmClient(RequestsClient):
                 timeout=int(self.cfg["timeout"]),
                 stream=bool(self.cfg.get("stream", False)),
             )
-            response.raise_for_status()
         except self.requests.exceptions.RequestException as exc:
-            raise RuntimeError(f"VLM service unavailable: {self.cfg['url']}") from exc
+            # 连不上 / 超时 / DNS 之类，这类才是真的 "unavailable"
+            raise RuntimeError(
+                f"VLM service unreachable: {self.cfg['url']} ({type(exc).__name__}: {exc})"
+            ) from exc
+        if response.status_code >= 400:
+            # 服务端有响应但报错：把状态码和返回体带出来，否则根本没法定位
+            detail = ""
+            try:
+                detail = str(response.json())
+            except Exception:
+                detail = response.text or ""
+            hint = ""
+            if response.status_code == 401:
+                hint = " —— api_key 不对或没发送，检查 provider 的 api_key 字段"
+            elif response.status_code == 404:
+                hint = " —— url 或 model 名字不对，确认与 --served-model-name 一致"
+            elif response.status_code == 400:
+                hint = " —— 请求体被拒，常见是超出 max_model_len 或 max_tokens 过大"
+            raise RuntimeError(
+                f"VLM HTTP {response.status_code} from {self.cfg['url']}{hint}: {detail[:600]}"
+            )
         if self.cfg.get("stream"):
             return self._extract_stream(response)
         return self._extract_message(response.json())
 
 
 class _PooledVlmClient:
-    def __init__(self, client: VlmClient, cfg: dict[str, Any]) -> None:
+    def __init__(self, client: VlmClient, cfg: dict[str, Any], shared_cooldown: SharedCooldown | None = None) -> None:
         self.client = client
         self.cfg = cfg
+        self.shared_cooldown = shared_cooldown
         self.name = client.name
         self.model = str(cfg.get("model") or "")
         self.weight = max(1, int(cfg.get("weight") or 1))
@@ -208,18 +318,33 @@ class _PooledVlmClient:
             return self._active
 
     def is_cooling_down(self, now: float) -> bool:
+        """now 是进程内的 monotonic 时钟；共享状态自己用 wall clock 判断。"""
         with self._lock:
-            return self._cooldown_until > now
+            if self._cooldown_until > now:
+                return True
+        if self.shared_cooldown is not None:
+            return self.shared_cooldown.cooling_down(self.name)
+        return False
 
     def mark_failure(self, cooldown_seconds: float, now: float) -> None:
         if cooldown_seconds <= 0:
             return
         with self._lock:
             self._cooldown_until = max(self._cooldown_until, now + cooldown_seconds)
+        if self.shared_cooldown is not None:
+            # 立即落盘，别的书籍进程下次调度就能看到，不用各自再踩一次。
+            self.shared_cooldown.mark(self.name, cooldown_seconds)
 
     def mark_success(self) -> None:
         with self._lock:
             self._cooldown_until = 0.0
+        if self.shared_cooldown is not None:
+            self.shared_cooldown.clear(self.name)
+
+    @property
+    def free_slots(self) -> int:
+        with self._lock:
+            return self.max_concurrency - self._active
 
     def supports(self, task_type: str, has_images: bool) -> bool:
         if self.cfg.get("enabled") is False:
@@ -230,20 +355,38 @@ class _PooledVlmClient:
             return False
         return True
 
-    def chat(self, prompt: str, images: list[Path] | None = None) -> VlmResponse:
+    def try_acquire(self) -> bool:
+        """非阻塞占一个槽位；占不到立刻返回 False，让调用方去问下一个 provider。"""
+        if not self._semaphore.acquire(blocking=False):
+            return False
+        with self._lock:
+            self._active += 1
+        return True
+
+    def acquire(self) -> None:
         self._semaphore.acquire()
         with self._lock:
             self._active += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._active -= 1
+        self._semaphore.release()
+
+    def chat_acquired(self, prompt: str, images: list[Path] | None = None) -> VlmResponse:
+        """调用方已经持有本 provider 的槽位。"""
+        return VlmResponse(
+            text=self.client.chat(prompt, images),
+            provider_name=self.name,
+            model=self.model,
+        )
+
+    def chat(self, prompt: str, images: list[Path] | None = None) -> VlmResponse:
+        self.acquire()
         try:
-            return VlmResponse(
-                text=self.client.chat(prompt, images),
-                provider_name=self.name,
-                model=self.model,
-            )
+            return self.chat_acquired(prompt, images)
         finally:
-            with self._lock:
-                self._active -= 1
-            self._semaphore.release()
+            self.release()
 
 
 class VlmPool:
@@ -264,9 +407,17 @@ class VlmPool:
         self._now_fn = now_fn or time.monotonic
         self._rr_index = 0
         self._lock = threading.Lock()
+        # 任一 provider 释放槽位时唤醒等待者，实现"谁先空谁拿下一个任务"。
+        self._slot_available = threading.Condition()
+        self._acquire_poll_seconds = 0.5
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], prompts: dict[str, str]) -> "VlmPool":
+        cooldown_dir = runtime_dir(cfg, "vlm_cooldown")
+        shared_cooldown = SharedCooldown(
+            cooldown_dir,
+            ttl_seconds=float(cfg.get("runtime", {}).get("cooldown_refresh_seconds", 1.0)),
+        )
         pool_cfg = cfg.get("vlm_pool")
         fallback_cfg: dict[str, Any] = {}
         provider_defaults: dict[str, Any] = {}
@@ -299,7 +450,17 @@ class VlmPool:
             provider_cfg.setdefault("name", f"vlm_{index}")
             provider_cfg.setdefault("capabilities", ["text", "image"])
             provider_cfg.setdefault("task_types", [])
-            clients.append(_PooledVlmClient(VlmClient(provider_cfg, prompts), provider_cfg))
+            clients.append(_PooledVlmClient(VlmClient(provider_cfg, prompts), provider_cfg, shared_cooldown))
+
+        seen_names: dict[str, int] = {}
+        for client in clients:
+            seen_names[client.name] = seen_names.get(client.name, 0) + 1
+        duplicates = sorted(name for name, count in seen_names.items() if count > 1)
+        if duplicates:
+            # name 是冷却状态的文件名，重名会让多个实例共用一份，一个挂了其余全被连坐。
+            raise ValueError(
+                "VLM provider names must be unique, duplicated: " + ", ".join(duplicates)
+            )
 
         return cls(
             clients,
@@ -315,11 +476,14 @@ class VlmPool:
         requirement = "image-capable " if has_images else ""
         raise RuntimeError(f"No {requirement}VLM provider is configured for task_type={task_type}.")
 
-    def _ranked_candidates(self, task_type: str, has_images: bool) -> tuple[list[_PooledVlmClient], bool]:
-        candidates = self._candidates(task_type, has_images)
+    def _ordered_candidates(self, candidates: list[_PooledVlmClient]) -> list[_PooledVlmClient]:
+        """按空闲程度排序：刚跑完的 provider 占用率最低，会排在最前面。
+
+        用占用率而不是绝对请求数，是为了让 max_concurrency 不同的 provider 之间按容量公平；
+        慢的 provider 请求压在手里更久，占用率一直偏高，自然就少分到任务。
+        """
         now = float(self._now_fn())
         available = [client for client in candidates if not client.is_cooling_down(now)]
-        all_cooling_down = not available
         if available:
             candidates = available
         with self._lock:
@@ -332,33 +496,67 @@ class VlmPool:
                 ((item[0] - start) % len(candidates)) / item[1].weight,
             )
         )
-        return [client for _, client in indexed], all_cooling_down
+        return [client for _, client in indexed]
+
+    def _acquire_free(self, candidates: list[_PooledVlmClient]) -> _PooledVlmClient | None:
+        """抢下第一个有空槽的 provider；全忙就等到有人释放为止。
+
+        关键在于不阻塞在某个被"指派"的 provider 上：只要还有别的 provider 空着，
+        当前线程立刻用那一个。谁先跑完谁先释放槽位，也就先接到下一个任务。
+        """
+        if not candidates:
+            return None
+        with self._slot_available:
+            while True:
+                for client in self._ordered_candidates(candidates):
+                    if client.try_acquire():
+                        return client
+                self._slot_available.wait(timeout=self._acquire_poll_seconds)
+
+    def _release(self, client: _PooledVlmClient) -> None:
+        # 先彻底释放 provider 自己的锁，再去拿条件变量，避免和等待者形成反向加锁顺序。
+        client.release()
+        with self._slot_available:
+            self._slot_available.notify_all()
 
     def chat(self, task_type: str, prompt: str, images: list[Path] | None = None) -> VlmResponse:
         has_images = bool(images)
-        candidates, all_cooling_down = self._ranked_candidates(task_type, has_images)
+        candidates = self._candidates(task_type, has_images)
+        now = float(self._now_fn())
+        all_cooling_down = all(client.is_cooling_down(now) for client in candidates)
         if self.fallback_enabled:
             attempts = len(candidates) if all_cooling_down else min(len(candidates), self.max_attempts)
         else:
             attempts = 1
         last_error: Exception | None = None
-        for client in candidates[:attempts]:
+        attempt_errors: list[str] = []
+        tried: set[int] = set()
+        for _ in range(attempts):
+            remaining = [client for client in candidates if id(client) not in tried]
+            client = self._acquire_free(remaining)
+            if client is None:
+                break
+            tried.add(id(client))
             try:
-                response = client.chat(prompt, images)
+                response = client.chat_acquired(prompt, images)
                 client.mark_success()
                 return response
             except Exception as exc:
                 last_error = exc
+                attempt_errors.append(f"{client.name}({client.model}): {exc}")
                 client.mark_failure(self.cooldown_seconds, float(self._now_fn()))
                 if not self.fallback_enabled:
                     break
+            finally:
+                self._release(client)
         if last_error is not None:
-            raise last_error
+            detail = " | ".join(attempt_errors) if attempt_errors else str(last_error)
+            raise RuntimeError(f"All attempted VLM providers failed for task_type={task_type}: {detail}") from last_error
         raise RuntimeError(f"No VLM provider attempted for task_type={task_type}.")
 
 
 def _strip_json_fence(text: str) -> str:
-    stripped = text.strip()
+    stripped = strip_reasoning(text)
     if not stripped.startswith("```"):
         return stripped
     lines = stripped.splitlines()
@@ -369,10 +567,42 @@ def _strip_json_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _extract_balanced(text: str, opener: str, closer: str) -> str | None:
+    start = text.find(opener)
+    if start < 0:
+        return None
+    in_string = False
+    escaped = False
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return text[start:]
+
+
 def _extract_json_array(text: str) -> str:
     start = text.find("[")
     if start < 0:
-        return text
+        # 只生成一条样本时，模型常常直接返回对象而不是单元素数组；
+        # 把对象本体切出来，免得前后的说明文字把解析带偏。
+        extracted = _extract_balanced(text, "{", "}")
+        return extracted if extracted is not None else text
     in_string = False
     escaped = False
     depth = 0
@@ -400,6 +630,41 @@ def _extract_json_array(text: str) -> str:
 
 def _remove_trailing_commas(text: str) -> str:
     return re.sub(r",(\s*[\]}])", r"\1", text)
+
+
+def _escape_invalid_json_string_backslashes(text: str) -> str:
+    chars: list[str] = []
+    in_string = False
+    index = 0
+    valid_simple_escapes = {'"', "\\", "/", "b", "f", "n", "r", "t"}
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            chars.append(char)
+            in_string = not in_string
+            index += 1
+            continue
+        if char != "\\" or not in_string:
+            chars.append(char)
+            index += 1
+            continue
+
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if next_char in valid_simple_escapes:
+            chars.append(char)
+            chars.append(next_char)
+            index += 2
+            continue
+        if next_char == "u":
+            unicode_digits = text[index + 2 : index + 6]
+            if len(unicode_digits) == 4 and all(item in "0123456789abcdefABCDEF" for item in unicode_digits):
+                chars.append(text[index : index + 6])
+                index += 6
+                continue
+
+        chars.append("\\\\")
+        index += 1
+    return "".join(chars)
 
 
 def _escape_unescaped_inner_quotes(text: str) -> str:
@@ -435,29 +700,50 @@ def _escape_unescaped_inner_quotes(text: str) -> str:
     return "".join(chars)
 
 
+def _loads_json(text: str) -> Any:
+    """按非严格模式解析。
+
+    strict=False 只放开一件事：允许字符串内出现未转义的控制字符（真实换行、制表符）。
+    大模型写多行 answer 时经常直接敲回车而不是 \n，标准 json.loads 会报
+    "Invalid control character"，整条响应就废了。其余语法仍然严格校验。
+    """
+    return json.loads(text, strict=False)
+
+
 def _loads_json_array(text: str) -> Any:
+    extracted = _extract_json_array(text)
+    without_trailing_commas = _remove_trailing_commas(extracted)
+    backslash_repaired = _escape_invalid_json_string_backslashes(without_trailing_commas)
     candidates = [
         text,
-        _extract_json_array(text),
-        _remove_trailing_commas(_extract_json_array(text)),
-        _escape_unescaped_inner_quotes(_remove_trailing_commas(_extract_json_array(text))),
+        extracted,
+        without_trailing_commas,
+        backslash_repaired,
+        _escape_unescaped_inner_quotes(without_trailing_commas),
+        _escape_unescaped_inner_quotes(backslash_repaired),
     ]
     last_error: json.JSONDecodeError | None = None
     for candidate in candidates:
         try:
-            return json.loads(candidate)
+            return _loads_json(candidate)
         except json.JSONDecodeError as exc:
             last_error = exc
     if last_error is not None:
-        raise ValueError(f"VLM response is not valid JSON array: {last_error}") from last_error
+        preview = text.strip()[:200].replace("\n", "\\n")
+        raise ValueError(f"VLM response is not valid JSON array: {last_error} | 响应开头: {preview!r}")
     raise ValueError("VLM response is empty.")
 
 
 def parse_json_array(text: str) -> list[dict[str, Any]]:
     stripped = _strip_json_fence(text)
     payload = _loads_json_array(stripped)
+    if isinstance(payload, dict):
+        # expected_count 为 1 时模型经常返回 {...} 而不是 [{...}]，
+        # 内容是对的，没必要整条丢掉。
+        return [payload]
     if not isinstance(payload, list):
-        raise ValueError("VLM response must be a JSON array.")
+        preview = stripped[:200].replace("\n", "\\n")
+        raise ValueError(f"VLM response must be a JSON array or object, got {type(payload).__name__} | 响应开头: {preview!r}")
     return [item for item in payload if isinstance(item, dict)]
 
 
@@ -474,20 +760,26 @@ def parse_jsonl_objects(text: str) -> list[dict[str, Any]]:
         if not candidate or candidate in {"[", "]"} or candidate.startswith("```"):
             continue
         try:
-            payload = json.loads(candidate)
+            payload = _loads_json(candidate)
         except json.JSONDecodeError:
             start = candidate.find("{")
             end = candidate.rfind("}")
             if start < 0 or end <= start:
                 continue
-            payload = json.loads(candidate[start : end + 1])
+            try:
+                payload = _loads_json(candidate[start : end + 1])
+            except json.JSONDecodeError:
+                continue
         if isinstance(payload, dict):
             rows.append(payload)
 
     if rows:
         return rows
 
-    payload = json.loads(stripped)
+    try:
+        payload = _loads_json(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"VLM response is not valid JSONL/JSON: {exc}") from exc
     if isinstance(payload, dict):
         return [payload]
     raise ValueError("VLM response must be JSONL objects, a JSON object, or a JSON array.")

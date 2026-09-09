@@ -92,3 +92,6 @@ class PipelineOptions:
     min_block_text_chars: int | None = None
     task_types: list[str] | None = None
     limit_books: int | None = None
+    recursive: bool | None = None
+    log_level: str | None = None
+    progress: bool | None = None
