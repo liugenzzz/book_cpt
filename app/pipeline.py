@@ -726,6 +726,7 @@ def _build_vlm_pool(cfg: dict[str, Any]) -> VlmPool:
             }
         },
     )
+    _scale_provider_quota(cfg, book_workers)
     return VlmPool.from_config(cfg, cfg["prompts"])
 
 

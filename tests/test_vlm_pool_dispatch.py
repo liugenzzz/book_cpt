@@ -177,6 +177,22 @@ class QuotaScalingTests(unittest.TestCase):
         self.assertEqual(providers[0]["min_interval_seconds"], 2.0)
         self.assertEqual(providers[1]["max_concurrency"], 1)  # 向下取整但不低于 1
 
+    def test_build_vlm_pool_actually_applies_the_scaling(self) -> None:
+        """摊薄函数写了但没被调用过一次 —— 单测只测函数本身是发现不了的。"""
+        from book_cpt.app import pipeline
+        from book_cpt.core.config_loader import load_config
+
+        cfg = load_config()
+        cfg["runtime"]["book_workers"] = 4
+        declared = [int(p["max_concurrency"]) for p in cfg["vlm_pool"]["providers"]]
+        pool = pipeline._build_vlm_pool(cfg)
+        self.assertEqual(
+            [client.max_concurrency for client in pool.clients],
+            [max(1, value // 4) for value in declared],
+        )
+        # 传进去的 cfg 不该被就地改小，否则同一进程里第二次建池会再摊薄一遍
+        self.assertEqual([int(p["max_concurrency"]) for p in cfg["vlm_pool"]["providers"]], declared)
+
     def test_single_process_keeps_declared_quota(self) -> None:
         from book_cpt.app import pipeline
 

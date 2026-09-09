@@ -155,21 +155,29 @@ python app\cli.py --input-dir book_cpt\data --output-root book_cpt\outputs --boo
 ### 多实例调度
 
 `config.py` 的 `mineru.providers` 和 `vlm_pool.providers` 都可以配多个实例，调度是抢占式的：谁先空出来谁接下一个任务。
+当前随仓库带的是 16 个 VLM 实例和 2 个 MinerU 实例（`vlm-http-client` 后端，`server_url` 指向推理服务）。
 
 - MinerU 槽位是 `output-root/.runtime/mineru_slots/<provider>/slot_N.lock` 文件锁，跨进程（乃至共享盘上跨主机）都成立；
   实例连不上时按 `mineru.cooldown_seconds` 进冷却，期间不再往它派活，解析结果不完整则不算实例的锅、不冷却。
   只配 `mineru.url` 不配 `providers` 时行为与单实例时完全一致。
+  `vlm-http-client` 后端必须带 `server_url`，否则服务端会去读 `MINERU_VL_SERVER` 环境变量，读不到就以 409 返回。
 - VLM 侧的冷却状态写在 `output-root/.runtime/vlm_cooldown/` 下，多个书籍进程共享；
   一个实例挂了只需被踩一次，不用每个进程各踩一遍。provider 的 `name` 是冷却文件名，重名会在启动时直接报错。
 - `--book-workers > 1` 时每个子进程各建一份 VlmPool，所以 provider 的 `max_concurrency` 和
   `min_interval_seconds` 会按进程数自动摊薄，实际压到服务上的并发就是配置里写的那个数。
 
-### 去水印（默认关闭）
+### 去水印（默认开启）
 
-`config.py` 的 `watermark.enabled` 打开后，会把整册重复出现（覆盖率超过 `min_page_coverage`）的水印
-Form XObject 调用剔掉，另存一份干净 PDF 再送 MinerU，报告写在 `preprocessed/watermark_cleaning.json`。
-书籍版式比期刊杂，误删正文可选内容组的风险更高，所以默认不开；开启后该书的各级缓存会自动失效重跑。
-即使关闭，损坏 PDF 的检测仍然生效。
+会把整册重复出现（覆盖率超过 `watermark.min_page_coverage`，默认 0.6）的水印 Form XObject 调用剔掉，
+另存一份干净 PDF 再送 MinerU，报告写在 `preprocessed/watermark_cleaning.json`。命中的判据是三选一：
+可选内容组（`/OC`）、`watermark.form_names` 里点名的对象名、`watermark.image_sizes` 里点名的图片尺寸。
+
+- 清理确实发生时，该书的 MinerU / normalized / samples / exports 缓存会自动失效并重渲染页面 ——
+  输入 PDF 变了，基于旧 PDF 的缓存一律不能再用。
+- 没找到候选就原样透传，不会多写一份 PDF。
+- 代价是每本书都要用 pypdf 完整解析一遍各页的内容流；大部头书这一步不便宜。
+  想关掉：`config.py` 里把 `watermark.enabled` 设成 `false`。
+- 关掉后损坏 PDF 的检测仍然生效（照样走跳过而不是失败）。
 
 ## 运行观测
 

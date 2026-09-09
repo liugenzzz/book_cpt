@@ -160,3 +160,28 @@ class PipelineSkipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShippedWatermarkConfigTests(unittest.TestCase):
+    def test_watermark_cleaning_is_enabled_by_default(self) -> None:
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.processing.watermark import watermark_cleaning_enabled
+
+        self.assertTrue(watermark_cleaning_enabled(load_config()))
+
+    def test_plain_pdf_is_passed_through_untouched(self) -> None:
+        """没有水印的书不该被改写，也不该因此让缓存失效。"""
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.processing.watermark import clean_pdf_watermarks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "plain.pdf"
+            pdf.write_bytes(_minimal_pdf())
+            cfg = load_config()
+            cfg["runtime"]["output_root"] = str(Path(tmp) / "out")
+            book = _book(tmp, pdf)
+            result = clean_pdf_watermarks(book, cfg)
+            self.assertFalse(result.cleaned)
+            self.assertEqual(result.cleaned_pdf, str(pdf))
+            self.assertEqual(result.candidate_names, [])
+            self.assertEqual(result.content_hash, book.file_hash)
