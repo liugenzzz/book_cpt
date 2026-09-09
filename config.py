@@ -192,9 +192,12 @@ CFG = {
         "output_root": "book_cpt/outputs",
         "cache_only": False,
         "recursive": False,
-        "book_workers": 4,
-        "max_workers": 8,
-        "page_workers": 4,
+        # 与 journal_cpt 对齐：16 个书籍进程 × 每进程 16 路生成 = 256 路，
+        # 正好等于 16 个 VLM 实例 × 16 槽位；摊薄后每个进程在每个实例上占 1 槽。
+        "book_workers": 16,
+        "max_workers": 16,
+        # 页面渲染是 CPU/磁盘密集，跟 16 个进程叠乘，这里压到 2。
+        "page_workers": 2,
         "crop_workers": 4,
         "vlm_max_pending": 8,
         "vlm_min_interval_seconds": 0.0,

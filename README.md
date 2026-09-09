@@ -146,6 +146,23 @@ python app\cli.py --book "E:\航天\book_cpt\data\飞行员航空知识手册.pd
 
 例如 `--book-workers 2 --max-workers 4` 时，理论上最多会有约 8 个大模型生成请求并行。`page-workers` 和 `crop-workers` 主要消耗 CPU、磁盘和图片处理资源；`max-workers` 主要消耗大模型服务并发额度。机器资源或模型服务不稳定时，建议先从 `--book-workers 1 --page-workers 2 --crop-workers 2 --max-workers 2` 开始。
 
+### 随仓库带的默认值
+
+`config.py` 里的默认并发与模型池是配套算过的，直接跑不用传参：
+
+```text
+book_workers 16 × max_workers 16 = 256 路生成并发
+16 个 VLM 实例 × 声明 max_concurrency 16 = 256 个槽位
+摊薄后每个进程在每个实例上占 1 槽 —— 不多不少，刚好填满
+```
+
+- `page_workers` 压到 2：页面渲染是 CPU/磁盘密集，会跟 16 个书籍进程叠乘（16×2 = 32 个渲染进程）。
+- `crop_workers` 仍是 4，叠乘后是 64 个裁剪进程。book_cpt 的 `crop_blocks` 是开着的
+  （journal_cpt 那边整个关掉了，所以它不在意这个值），机器扛不住就调小。
+- MinerU 槽位是文件锁，全局 2 实例 × 16 = 32，**不随 `book_workers` 叠乘**。
+
+跑不满或者压垮服务时，优先动 `--book-workers` 和 `--max-workers`，两者的乘积才是打到模型服务上的真实并发。
+
 如果问题集中在 MinerU 服务，推荐保留多本书调度，但单独限制 MinerU：
 
 ```powershell
