@@ -189,8 +189,11 @@ python app\cli.py --input-dir book_cpt\data --output-root book_cpt\outputs --boo
 另存一份干净 PDF 再送 MinerU，报告写在 `preprocessed/watermark_cleaning.json`。命中的判据是三选一：
 可选内容组（`/OC`）、`watermark.form_names` 里点名的对象名、`watermark.image_sizes` 里点名的图片尺寸。
 
-- 清理确实发生时，该书的 MinerU / normalized / samples / exports 缓存会自动失效并重渲染页面 ——
-  输入 PDF 变了，基于旧 PDF 的缓存一律不能再用。
+- **只有「这一轮真的重新清理过」才让缓存失效**（输入 PDF 变了，基于旧 PDF 的缓存不能再用）。
+  第二轮起如果源 PDF 和判定参数都没变，直接沿用上一轮的产物，报告里 `reused: true`，
+  缓存照常复用 —— 否则带水印的书每轮都要从头重跑 MinerU 和全部样本。
+  快速路径靠报告里的 `source_hash` + `config_signature` 判断；对不上时会重扫一遍，
+  再拿 `content_hash` 兜底比对，产物逐字节相同仍算复用。
 - 没找到候选就原样透传，不会多写一份 PDF。
 - 代价是每本书都要用 pypdf 完整解析一遍各页的内容流；大部头书这一步不便宜。
   想关掉：`config.py` 里把 `watermark.enabled` 设成 `false`。

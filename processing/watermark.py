@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ..core.io_utils import file_sha256, write_json
+from ..core.io_utils import file_sha256, read_json, stable_json_hash, write_json
 from ..core.models import BookRecord
 
 
@@ -24,6 +24,11 @@ class WatermarkCleanResult:
     removed_invocations: int
     page_count: int
     content_hash: str
+    source_hash: str = ""
+    config_signature: str = ""
+    # True 表示这一轮没有重新清理，直接沿用上一轮的产物。
+    # 上游据此判断"输入 PDF 这一轮有没有变"，没变就不该作废缓存。
+    reused: bool = False
 
 
 def _watermark_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +56,89 @@ def _probe_readable(source_pdf: Path) -> int:
         return len(reader.pages)
     except Exception as exc:
         raise UnreadablePdfError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _config_signature(cfg: dict[str, Any]) -> str:
+    """只有这几项会影响清理结果，用它们判断上一轮的产物还能不能沿用。"""
+    watermark_cfg = _watermark_cfg(cfg)
+    return stable_json_hash(
+        {
+            "enabled": bool(watermark_cfg.get("enabled", False)),
+            "form_names": sorted(str(item) for item in watermark_cfg.get("form_names", [])),
+            "image_sizes": sorted(
+                [int(item[0]), int(item[1])]
+                for item in watermark_cfg.get("image_sizes", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ),
+            "min_page_coverage": float(watermark_cfg.get("min_page_coverage", 0.6) or 0.6),
+        }
+    )
+
+
+def _previous_report(report_path: Path) -> dict[str, Any] | None:
+    if not report_path.is_file():
+        return None
+    try:
+        payload = read_json(report_path)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _unchanged_since_previous_run(
+    previous: dict[str, Any] | None,
+    result: WatermarkCleanResult,
+) -> bool:
+    """这一轮扫出来的结果跟上一轮一模一样吗？
+
+    走到这里说明快速路径没命中 —— 通常是上一轮的报告由旧版本写的、没记
+    source_hash/config_signature。重扫一遍不贵，贵的是因此误判"输入 PDF 变了"
+    而把 MinerU 缓存作废、整本书重跑。所以拿 content_hash 兜底比对：
+    一致就说明产物没变，缓存仍然对应同一份 PDF。
+    """
+    if previous is None:
+        return False
+    if bool(previous.get("cleaned")) != result.cleaned:
+        return False
+    return str(previous.get("content_hash") or "") == str(result.content_hash or "")
+
+
+def _reusable_previous_result(
+    report_path: Path,
+    book: BookRecord,
+    signature: str,
+) -> WatermarkCleanResult | None:
+    """上一轮的清理结果还算数吗？
+
+    算数的条件是源 PDF 没换（hash 相同）、判定参数没改（signature 相同）。
+    这件事必须做对两件：一是省掉重复扫描（每页内容流都要完整解析一遍，不便宜），
+    二是让 reused=True 传上去 —— 否则上游每轮都以为"输入 PDF 刚变过"，
+    把 MinerU/normalized/samples/exports 缓存全作废，整本书永远在从头重跑。
+    """
+    payload = _previous_report(report_path)
+    if payload is None:
+        return None
+    if str(payload.get("source_hash") or "") != str(book.file_hash or ""):
+        return None
+    if str(payload.get("config_signature") or "") != signature:
+        return None
+    cleaned = bool(payload.get("cleaned"))
+    cleaned_pdf = str(payload.get("cleaned_pdf") or book.source_pdf)
+    if cleaned and not Path(cleaned_pdf).is_file():
+        return None
+    candidates = payload.get("candidate_names")
+    return WatermarkCleanResult(
+        source_pdf=str(book.source_pdf),
+        cleaned_pdf=cleaned_pdf,
+        cleaned=cleaned,
+        candidate_names=[str(item) for item in candidates] if isinstance(candidates, list) else [],
+        removed_invocations=int(payload.get("removed_invocations") or 0),
+        page_count=int(payload.get("page_count") or book.page_count),
+        content_hash=str(payload.get("content_hash") or book.file_hash),
+        source_hash=str(book.file_hash or ""),
+        config_signature=signature,
+        reused=True,
+    )
 
 
 def _operator_text(operator: Any) -> str:
@@ -195,6 +283,21 @@ def clean_pdf_watermarks(book: BookRecord, cfg: dict[str, Any]) -> WatermarkClea
     source_pdf = Path(book.source_pdf)
     cleaned_pdf, report_path = _output_paths(book, cfg)
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    signature = _config_signature(cfg)
+    fast_path = _reusable_previous_result(report_path, book, signature)
+    if fast_path is not None:
+        # 报告也刷一遍，否则磁盘上留的是上一轮 reused=False 的旧记录，
+        # 排查时会被误读成"这一轮又重新清理了"。
+        write_json(report_path, asdict(fast_path))
+        return fast_path
+    previous = _previous_report(report_path)
+
+    def _finish(result: WatermarkCleanResult) -> WatermarkCleanResult:
+        if _unchanged_since_previous_run(previous, result):
+            result = replace(result, reused=True)
+        write_json(report_path, asdict(result))
+        return result
+
     if not watermark_cleaning_enabled(cfg):
         result = WatermarkCleanResult(
             source_pdf=str(source_pdf),
@@ -204,9 +307,10 @@ def clean_pdf_watermarks(book: BookRecord, cfg: dict[str, Any]) -> WatermarkClea
             removed_invocations=0,
             page_count=_probe_readable(source_pdf) or book.page_count,
             content_hash=book.file_hash,
+            source_hash=book.file_hash,
+            config_signature=signature,
         )
-        write_json(report_path, asdict(result))
-        return result
+        return _finish(result)
 
     from pypdf import PdfReader, PdfWriter  # type: ignore
 
@@ -226,9 +330,10 @@ def clean_pdf_watermarks(book: BookRecord, cfg: dict[str, Any]) -> WatermarkClea
             removed_invocations=0,
             page_count=len(reader.pages),
             content_hash=book.file_hash,
+            source_hash=book.file_hash,
+            config_signature=signature,
         )
-        write_json(report_path, asdict(result))
-        return result
+        return _finish(result)
 
     cleaned_pdf.parent.mkdir(parents=True, exist_ok=True)
     writer = PdfWriter()
@@ -244,7 +349,8 @@ def clean_pdf_watermarks(book: BookRecord, cfg: dict[str, Any]) -> WatermarkClea
         removed_invocations=removed,
         page_count=len(reader.pages),
         content_hash=file_sha256(cleaned_pdf, int(cfg["hash_chunk_size"])) if removed > 0 else book.file_hash,
+        source_hash=book.file_hash,
+        config_signature=signature,
     )
-    write_json(report_path, asdict(result))
-    return result
+    return _finish(result)
 

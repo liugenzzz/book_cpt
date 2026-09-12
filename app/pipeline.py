@@ -767,7 +767,9 @@ def _process_book(book: Any, cfg: dict[str, Any], vlm: VlmPool | None = None) ->
         )
         working_book = replace(book, source_pdf=watermark_result.cleaned_pdf) if watermark_result.cleaned else book
         working_cfg = cfg
-        if watermark_result.cleaned:
+        # 只有"这一轮真的重新清理过"才作废缓存。沿用上一轮产物时（reused）缓存
+        # 对应的就是同一份清理后的 PDF，作废它等于每轮都从头重跑整本书。
+        if watermark_result.cleaned and not watermark_result.reused:
             # 输入 PDF 换了内容，所有基于旧 PDF 的缓存都不能再用。
             working_cfg = deepcopy(cfg)
             working_cfg["runtime"]["reuse_mineru"] = False
