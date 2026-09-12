@@ -209,6 +209,11 @@ python app\cli.py --input-dir book_cpt\data --output-root book_cpt\outputs --boo
 - 收尾摘要：跑完在 stderr 打一段 `完成 38/40 本，样本 5123 条`，并分别列出跳过和失败的书。
 - 损坏 PDF：pypdf 打不开的文件（截断、加密、结构损坏）算「跳过」不算「失败」，
   记进 `<output-root>/skipped_books.jsonl`，不会中断整批。
+- 结构有瑕疵但能读的 PDF（`too many kids in page tree` 之类）：MuPDF 的报错是 C 库
+  直写 stderr 的，Python logging 压不住，所以默认关掉逐条输出，改由 `render_pages`
+  汇总成一条 `pdf structure complaints book_id=... count=N`。想看原始报错就把
+  `config.py` 的 `render.silence_mupdf_errors` 设成 `false`。
+- Ctrl-C 会取消排队中的任务并立刻退出。已完成的书都已落盘，重跑走缓存接上。
 - 整批生成全失败时抛 `GenerationBatchError`，消息里带 book_id、任务分布和去重后的错误原文，
   不再静默返回 0 条样本。
 - HTTP 报错不再只说「service unavailable」：401/404/400 会带上状态码、返回体和常见原因提示；

@@ -1017,24 +1017,35 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
                 results.append(result)
         return results
 
+    ordered_results: list[dict[str, Any] | None] = [None] * total
     with ProgressBar(total, desc="书籍", enabled=show_progress) as bar:
         with ProcessPoolExecutor(max_workers=book_workers) as executor:
             futures = {executor.submit(_process_book, book, cfg): index for index, book in enumerate(books)}
-            ordered_results: list[dict[str, Any] | None] = [None] * total
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:  # 单本书崩溃不该带崩整批
-                    result = {
-                        "book_id": books[index].book_id,
-                        "output_dir": books[index].output_dir,
-                        "sample_count": 0,
-                        "error": str(exc),
-                    }
-                ordered_results[index] = result
-                _record_skip(result)
-                _log_book_done(result)
-                ok, label = _summarize(result)
-                bar.advance(ok=ok, current=label)
+            try:
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:  # 单本书崩溃不该带崩整批
+                        result = {
+                            "book_id": books[index].book_id,
+                            "output_dir": books[index].output_dir,
+                            "sample_count": 0,
+                            "error": str(exc),
+                        }
+                    ordered_results[index] = result
+                    _record_skip(result)
+                    _log_book_done(result)
+                    ok, label = _summarize(result)
+                    bar.advance(ok=ok, current=label)
+            except KeyboardInterrupt:
+                # 整批书是一次性全提交的；不取消排队任务的话，with 退出时的
+                # shutdown(wait=True) 会把剩下所有书都跑完，Ctrl-C 形同虚设。
+                # 已完成的书都已落盘，重跑会走缓存接上。
+                run_logger.warning(
+                    "interrupted 已完成 %s/%s 本，剩余任务已取消；重跑会从缓存接上",
+                    tally["done"], total,
+                )
+                executor.shutdown(wait=False, cancel_futures=True)
+                return [result for result in ordered_results if result is not None]
     return [result for result in ordered_results if result is not None]

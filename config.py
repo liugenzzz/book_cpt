@@ -233,7 +233,15 @@ CFG = {
         "cleaned_pdf_path": "preprocessed/{book_id}_cleaned.pdf",
         "report_path": "preprocessed/watermark_cleaning.json",
     },
-    "render": {"dpi": 180, "image_format": "png", "max_side": 2200, "retry_count": 2},
+    "render": {
+        "dpi": 180,
+        "image_format": "png",
+        "max_side": 2200,
+        "retry_count": 2,
+        # MuPDF 的报错是 C 库直写 stderr 的，页树/xref 有瑕疵的书会逐次刷屏。
+        # 关掉逐条输出，改由 render_pages 汇总成一条 WARNING。
+        "silence_mupdf_errors": True,
+    },
     "crop_filter": {
         "enabled": True,
         "min_width": 28,
