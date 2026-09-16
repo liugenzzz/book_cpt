@@ -701,14 +701,31 @@ def _scale_provider_quota(cfg: dict[str, Any], divisor: int) -> None:
     providers = cfg.get("vlm_pool", {}).get("providers")
     if not isinstance(providers, list):
         return
+    oversubscribed: list[tuple[str, int]] = []
     for provider in providers:
         if not isinstance(provider, dict):
             continue
         declared = max(1, int(provider.get("max_concurrency") or 1))
+        if declared < divisor and provider.get("enabled") is not False:
+            # 摊薄不到 1 只能抬回 1，声明的上限就守不住了 —— 必须说出来。
+            oversubscribed.append((str(provider.get("name") or "?"), declared))
         provider["max_concurrency"] = max(1, declared // divisor)
         interval = float(provider.get("min_interval_seconds") or 0.0)
         if interval > 0:
             provider["min_interval_seconds"] = interval * divisor
+    if oversubscribed:
+        worst = min(declared for _, declared in oversubscribed)
+        _state_logger(cfg).warning(
+            "provider 并发上限守不住：book_workers=%s 大于 %s 个实例声明的 max_concurrency"
+            "（最小 %s）。每个进程至少占 1 槽，这些实例实际会承受 %s 路并发，"
+            "是声明值的 %.1f 倍。要真正守住上限，book_workers 不能超过 max_concurrency。示例：%s",
+            divisor,
+            len(oversubscribed),
+            worst,
+            divisor,
+            divisor / worst,
+            ", ".join(f"{name}({declared})" for name, declared in oversubscribed[:3]),
+        )
 
 
 def _build_vlm_pool(cfg: dict[str, Any]) -> VlmPool:

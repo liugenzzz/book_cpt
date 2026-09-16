@@ -282,3 +282,61 @@ class ProviderNameUniquenessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OversubscriptionWarningTests(unittest.TestCase):
+    """book_workers 超过 provider 的 max_concurrency 时，摊薄只能抬回 1，
+    声明的上限就守不住了。这事必须吼一声，否则是静默的 N 倍超配。"""
+
+    def _cfg(self, declared, enabled=True):
+        return {
+            "logger_name": "book_cpt_oversub_test",
+            "vlm_pool": {"providers": [
+                {"name": "a", "max_concurrency": declared, **({} if enabled else {"enabled": False})},
+                {"name": "b", "max_concurrency": declared, **({} if enabled else {"enabled": False})},
+            ]},
+        }
+
+    def test_warns_when_declared_cap_cannot_be_honored(self) -> None:
+        import logging
+
+        from book_cpt.app import pipeline
+
+        cfg = self._cfg(8)
+        logger = logging.getLogger("book_cpt_oversub_test")
+        with self.assertLogs(logger, level="WARNING") as captured:
+            pipeline._scale_provider_quota(cfg, 16)
+        joined = "\n".join(captured.output)
+        self.assertIn("book_workers=16", joined)
+        self.assertIn("2.0 倍", joined)
+        # 抬回 1，而不是 0
+        self.assertEqual([p["max_concurrency"] for p in cfg["vlm_pool"]["providers"]], [1, 1])
+
+    def test_silent_when_the_cap_still_holds(self) -> None:
+        import logging
+
+        from book_cpt.app import pipeline
+
+        cfg = self._cfg(16)
+        logger = logging.getLogger("book_cpt_oversub_test")
+        with self.assertNoLogs(logger, level="WARNING"):
+            pipeline._scale_provider_quota(cfg, 8)
+        self.assertEqual([p["max_concurrency"] for p in cfg["vlm_pool"]["providers"]], [2, 2])
+
+    def test_exactly_divisible_is_not_a_warning(self) -> None:
+        import logging
+
+        from book_cpt.app import pipeline
+
+        logger = logging.getLogger("book_cpt_oversub_test")
+        with self.assertNoLogs(logger, level="WARNING"):
+            pipeline._scale_provider_quota(self._cfg(8), 8)
+
+    def test_disabled_providers_do_not_trigger_the_warning(self) -> None:
+        import logging
+
+        from book_cpt.app import pipeline
+
+        logger = logging.getLogger("book_cpt_oversub_test")
+        with self.assertNoLogs(logger, level="WARNING"):
+            pipeline._scale_provider_quota(self._cfg(8, enabled=False), 16)
