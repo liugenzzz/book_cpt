@@ -718,7 +718,9 @@ def _scale_provider_quota(cfg: dict[str, Any], divisor: int) -> None:
         _state_logger(cfg).warning(
             "provider 并发上限守不住：book_workers=%s 大于 %s 个实例声明的 max_concurrency"
             "（最小 %s）。每个进程至少占 1 槽，这些实例实际会承受 %s 路并发，"
-            "是声明值的 %.1f 倍。要真正守住上限，book_workers 不能超过 max_concurrency。示例：%s",
+            "是声明值的 %.1f 倍。对 vLLM 这类自带排队的服务，这通常只是多一点排队延迟、"
+            "不减吞吐；对有硬性速率限制（429）的服务才是真问题。要严格守住上限，"
+            "book_workers 不能超过 max_concurrency。示例：%s",
             divisor,
             len(oversubscribed),
             worst,
