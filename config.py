@@ -264,7 +264,7 @@ CFG = {
         "skip_text_patterns": [r"^\s*第?\s*\d+\s*页\s*$", r"^.{1,30}\s+\d{1,4}\s*$"],
     },
     "mineru": {
-        "url": "http://10.107.231.26:8000",
+        "url": "http://10.107.231.26:9000",
         "server_url": "http://10.107.231.26:30000",
         "backend": "vlm-http-client",
         "parse_method": "auto",
@@ -278,7 +278,7 @@ CFG = {
         "return_images": True,
         "response_format_zip": False,
         "return_original_file": False,
-        "max_concurrency": 16,
+        "max_concurrency": 32,
         "slot_poll_seconds": 2,
         "slot_stale_seconds": 7200,
         "retry_count": 3,
@@ -295,16 +295,16 @@ CFG = {
         "providers": [
             {
                 "name": "mineru_1",
-                "url": "http://10.107.231.26:8000",
+                "url": "http://10.107.231.26:9000",
                 "server_url": "http://10.107.231.26:30000",
-                "max_concurrency": 16,
+                "max_concurrency": 32,
                 "weight": 1,
             },
             {
                 "name": "mineru_2",
                 "url": "http://10.107.231.26:9001",
                 "server_url": "http://10.107.231.26:30001",
-                "max_concurrency": 16,
+                "max_concurrency": 32,
                 "weight": 1,
             },
         ],
