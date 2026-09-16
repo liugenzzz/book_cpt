@@ -184,14 +184,25 @@ class QuotaScalingTests(unittest.TestCase):
 
         cfg = load_config()
         cfg["runtime"]["book_workers"] = 4
-        declared = [int(p["max_concurrency"]) for p in cfg["vlm_pool"]["providers"]]
+        declared = [
+            int(p["max_concurrency"])
+            for p in cfg["vlm_pool"]["providers"]
+            if p.get("enabled") is not False
+        ]
         pool = pipeline._build_vlm_pool(cfg)
         self.assertEqual(
             [client.max_concurrency for client in pool.clients],
             [max(1, value // 4) for value in declared],
         )
         # 传进去的 cfg 不该被就地改小，否则同一进程里第二次建池会再摊薄一遍
-        self.assertEqual([int(p["max_concurrency"]) for p in cfg["vlm_pool"]["providers"]], declared)
+        self.assertEqual(
+            [
+                int(p["max_concurrency"])
+                for p in cfg["vlm_pool"]["providers"]
+                if p.get("enabled") is not False
+            ],
+            declared,
+        )
 
     def test_single_process_keeps_declared_quota(self) -> None:
         from book_cpt.app import pipeline
@@ -231,6 +242,9 @@ class ProviderNameUniquenessTests(unittest.TestCase):
         pool = VlmPool.from_config(cfg, cfg["prompts"])
         self.assertEqual([c.name for c in pool.clients], ["a-8001", "b-8002"])
 
+    def _shipped_enabled(self, cfg) -> list:
+        return [p for p in cfg["vlm_pool"]["providers"] if p.get("enabled") is not False]
+
     def test_shipped_config_has_unique_names(self) -> None:
         from book_cpt.core.config_loader import load_config
 
@@ -238,7 +252,22 @@ class ProviderNameUniquenessTests(unittest.TestCase):
         pool = VlmPool.from_config(cfg, cfg["prompts"])
         names = [client.name for client in pool.clients]
         self.assertEqual(len(names), len(set(names)), f"重名: {names}")
-        self.assertEqual(len(names), len(cfg["vlm_pool"]["providers"]))
+        self.assertEqual(len(names), len(self._shipped_enabled(cfg)))
+
+    def test_shipped_names_are_unique_across_disabled_entries_too(self) -> None:
+        """name 是冷却文件名。停用的实例留在表里当档案，日后启用时不能撞名。"""
+        from book_cpt.core.config_loader import load_config
+
+        all_names = [p["name"] for p in load_config()["vlm_pool"]["providers"]]
+        self.assertEqual(len(all_names), len(set(all_names)), f"重名: {all_names}")
+
+    def test_disabled_shipped_providers_never_enter_the_pool(self) -> None:
+        from book_cpt.core.config_loader import load_config
+
+        cfg = load_config()
+        disabled = {p["name"] for p in cfg["vlm_pool"]["providers"] if p.get("enabled") is False}
+        pool = VlmPool.from_config(cfg, cfg["prompts"])
+        self.assertFalse(disabled & {client.name for client in pool.clients})
 
     def test_shipped_providers_declare_positive_quota(self) -> None:
         from book_cpt.core.config_loader import load_config
