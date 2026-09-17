@@ -216,6 +216,16 @@ def _sample_resume_key(sample: dict[str, Any], cfg: dict[str, Any]) -> str:
     )
 
 
+def _provider_timeout_hint(cfg: dict[str, Any]) -> Any:
+    """取 provider 里最大的 timeout，用于在心跳里提示"最坏还要等多久"。"""
+    timeouts = [
+        int(provider.get("timeout") or 0)
+        for provider in cfg.get("vlm_pool", {}).get("providers") or []
+        if isinstance(provider, dict) and provider.get("enabled") is not False
+    ]
+    return max(timeouts) if timeouts else "?"
+
+
 def _state_logger(cfg: dict[str, Any]) -> logging.Logger:
     return logging.getLogger(str(cfg.get("logger_name") or __name__))
 
@@ -364,7 +374,8 @@ def _generate_samples_for_jobs(
 
     def log_progress(force: bool = False) -> None:
         """生成阶段原本从 jobs=N 到 completed 之间一条日志都没有，几十分钟看不到任何动静。"""
-        nonlocal last_progress_at
+        nonlocal last_progress_at, last_completion_at
+        last_completion_at = time.monotonic()
         now = time.monotonic()
         if not force and done_jobs % progress_every and now - last_progress_at < progress_seconds:
             return
@@ -384,6 +395,30 @@ def _generate_samples_for_jobs(
             len(failures),
             elapsed / 60.0,
             eta / 60.0,
+        )
+
+    heartbeat_seconds = max(0.0, float(cfg["runtime"].get("generation_heartbeat_seconds", 120.0)))
+    last_completion_at = started_at
+
+    def log_heartbeat(inflight: int) -> None:
+        """一个任务都没完成时也要出声。
+
+        log_progress 只在任务完成时调用，wait() 又没有超时，所以整批请求都卡在
+        模型侧时日志会彻底安静 —— 从外面看和进程死了完全一样。单请求 timeout 是
+        2400s，真能安静 40 分钟。
+        """
+        stalled = time.monotonic() - last_completion_at
+        progress_logger.warning(
+            "generate 等待中 book_id=%s 在飞=%s jobs=%s/%s samples=%s failed=%s "
+            "距上次完成=%.1f分（单请求 timeout=%ss，仍在等模型响应）",
+            progress_book_id,
+            inflight,
+            done_jobs,
+            len(jobs),
+            len(raw_sample_rows),
+            len(failures),
+            stalled / 60.0,
+            _provider_timeout_hint(cfg),
         )
 
     flush_every = max(1, int(cfg["runtime"].get("generation_state_flush_every", 20)))
@@ -494,7 +529,14 @@ def _generate_samples_for_jobs(
                 futures[executor.submit(generate_for_job, job, output_dir, cfg, vlm)] = (job_index, job)
             if not futures:
                 break
-            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            done, pending = wait(
+                futures,
+                return_when=FIRST_COMPLETED,
+                timeout=heartbeat_seconds or None,
+            )
+            if not done:
+                log_heartbeat(len(pending))
+                continue
             for future in done:
                 job_index, job = futures.pop(future)
                 job_key = job_keys[job_index]

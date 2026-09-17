@@ -90,3 +90,57 @@ class RawSampleOrderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeartbeatTests(unittest.TestCase):
+    """一个任务都没完成时也得出声。
+
+    log_progress 只在任务完成时调用，wait() 原来还没有超时 —— 整批请求都卡在
+    模型侧时日志彻底安静，跟进程死了分不出来。单请求 timeout 2400s，真能静 40 分钟。
+    """
+
+    def _run(self, *, hold_seconds: float, heartbeat: float):
+        import logging
+        import threading
+
+        logger = logging.getLogger("book_cpt_heartbeat_test")
+        cfg = {
+            "task_types": ["paragraph_summary"],
+            "paths": {"sample_raw": "samples/raw/{task_type}.jsonl"},
+            "runtime": {
+                "max_workers": 2,
+                "vlm_max_pending": 2,
+                "generation_heartbeat_seconds": heartbeat,
+            },
+            "vlm_pool": {"providers": [{"name": "a", "timeout": 2400}]},
+        }
+        release = threading.Event()
+
+        def slow_generate(job, *_args):
+            release.wait(timeout=hold_seconds)
+            return [{"id": f"s{job.page.page_index}", "task_type": "paragraph_summary"}]
+
+        state = SimpleNamespace(error=lambda payload: None, logger=logger)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(pipeline, "generate_for_job", side_effect=slow_generate):
+                with self.assertLogs(logger, level="INFO") as captured:
+                    threading.Timer(hold_seconds, release.set).start()
+                    pipeline._generate_samples_for_jobs(
+                        jobs=_jobs(2), output_dir=Path(tmp), cfg=cfg, vlm=None, state=state
+                    )
+        return captured.output
+
+    def test_heartbeat_fires_while_nothing_completes(self) -> None:
+        lines = [line for line in self._run(hold_seconds=0.6, heartbeat=0.15) if "等待中" in line]
+        self.assertTrue(lines, "没有任务完成时必须打心跳")
+        self.assertIn("在飞=2", lines[0])
+        self.assertIn("timeout=2400s", lines[0])
+
+    def test_no_heartbeat_when_jobs_finish_promptly(self) -> None:
+        lines = [line for line in self._run(hold_seconds=0.0, heartbeat=30.0) if "等待中" in line]
+        self.assertEqual(lines, [])
+
+    def test_progress_still_logged_after_the_wait(self) -> None:
+        lines = [line for line in self._run(hold_seconds=0.6, heartbeat=0.15) if "generate progress" in line]
+        self.assertTrue(lines)
+        self.assertIn("jobs=2/2", lines[-1])

@@ -211,6 +211,9 @@ CFG = {
         # 生成阶段每完成多少个 job（或间隔多少秒）打一条带 ETA 的进度日志。
         "generation_progress_every": 10,
         "generation_progress_seconds": 60.0,
+        # 一个任务都没完成时，每隔这么久打一条"还在等模型"的心跳。
+        # 不打的话整批卡在模型侧时日志会彻底安静，跟进程死了分不出来。
+        "generation_heartbeat_seconds": 120.0,
         # 断点 checkpoint 攒批落盘的阈值，避免每个 job 都整份重写。
         "generation_state_flush_every": 20,
         "generation_state_flush_seconds": 10.0,
