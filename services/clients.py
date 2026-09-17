@@ -671,6 +671,31 @@ def _escape_invalid_json_string_backslashes(text: str) -> str:
     return "".join(chars)
 
 
+_BARE_MEMBER_RE = re.compile(r'\s*"(?:[^"\\]|\\.)*"\s*:')
+
+
+def _wrap_bare_object_members(text: str) -> str:
+    """模型把 [{...}] 写成了 [ "k": v, ... ]，少了内层花括号。
+
+    实测是 JSON 解析失败里最常见的一种，响应形如：
+        [\n  "instruction": "请分析该表格...",\n  "chart_subject": "..."
+    数组里直接摊着对象成员。json 在第 2 行那个冒号处报
+    Expecting ',' delimiter —— 因为数组里一个字符串元素后面只能跟逗号或右括号。
+    内容本身是对的，补上内层括号就能救回整条样本。
+
+    只在"开头就是 \"键\":"时才动手，避免把正常的字符串数组 ["a","b"] 弄坏。
+    """
+    stripped = text.strip()
+    if not stripped.startswith("["):
+        return text
+    inner = stripped[1:]
+    if inner.rstrip().endswith("]"):
+        inner = inner.rstrip()[:-1]
+    if not _BARE_MEMBER_RE.match(inner):
+        return text
+    return "[{" + inner + "}]"
+
+
 def _escape_unescaped_inner_quotes(text: str) -> str:
     chars: list[str] = []
     in_string = False
@@ -718,13 +743,17 @@ def _loads_json_array(text: str) -> Any:
     extracted = _extract_json_array(text)
     without_trailing_commas = _remove_trailing_commas(extracted)
     backslash_repaired = _escape_invalid_json_string_backslashes(without_trailing_commas)
+    braces_added = _wrap_bare_object_members(backslash_repaired)
     candidates = [
         text,
         extracted,
         without_trailing_commas,
         backslash_repaired,
+        braces_added,
+        _remove_trailing_commas(braces_added),
         _escape_unescaped_inner_quotes(without_trailing_commas),
         _escape_unescaped_inner_quotes(backslash_repaired),
+        _escape_unescaped_inner_quotes(braces_added),
     ]
     last_error: json.JSONDecodeError | None = None
     for candidate in candidates:
@@ -733,7 +762,7 @@ def _loads_json_array(text: str) -> Any:
         except json.JSONDecodeError as exc:
             last_error = exc
     if last_error is not None:
-        preview = text.strip()[:200].replace("\n", "\\n")
+        preview = text.strip()[:400].replace("\n", "\\n")
         raise ValueError(f"VLM response is not valid JSON array: {last_error} | 响应开头: {preview!r}")
     raise ValueError("VLM response is empty.")
 
@@ -746,7 +775,7 @@ def parse_json_array(text: str) -> list[dict[str, Any]]:
         # 内容是对的，没必要整条丢掉。
         return [payload]
     if not isinstance(payload, list):
-        preview = stripped[:200].replace("\n", "\\n")
+        preview = stripped[:400].replace("\n", "\\n")
         raise ValueError(f"VLM response must be a JSON array or object, got {type(payload).__name__} | 响应开头: {preview!r}")
     return [item for item in payload if isinstance(item, dict)]
 
