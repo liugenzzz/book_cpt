@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any
 
 from .image_quality import (
     is_complete_text_crop,
+    allow_large_images,
     is_meaningful_image,
     is_valid_crop_box,
     should_skip_crop_block,
@@ -77,9 +79,23 @@ def _visual_container_coverage_ok(
     return best_coverage >= min_coverage
 
 
-def _crop_page_worker(args: tuple[dict[str, Any], str, dict[str, Any]]) -> dict[str, Any]:
+def _crop_page_worker(args: tuple[dict[str, Any], str, dict[str, Any]]) -> tuple[dict[str, Any], str]:
+    """返回 (页面 payload, 错误说明)。
+
+    单页的图像处理出问题不该带崩整本书：早先一页近均匀的大图会让 PIL 算出负方差、
+    math.sqrt 抛 domain error；2 亿像素的大幅面图纸页会抛 DecompressionBombError。
+    这两种都直接冒到 _process_book 的 except，整本书记成失败。
+    现在把异常收在这一页，其余页照常裁。
+    """
     page_payload, output_dir_text, cfg = args
     page = _page_from_dict(page_payload)
+    try:
+        return _crop_one_page(page, output_dir_text, cfg), ""
+    except Exception as exc:
+        return asdict(page), f"{type(exc).__name__}: {exc}"
+
+
+def _crop_one_page(page: PageRecord, output_dir_text: str, cfg: dict[str, Any]) -> dict[str, Any]:
     try:
         from PIL import Image  # type: ignore
     except ImportError:
@@ -90,6 +106,7 @@ def _crop_page_worker(args: tuple[dict[str, Any], str, dict[str, Any]]) -> dict[
     if not page_image.exists():
         return asdict(page)
 
+    allow_large_images(cfg)
     with Image.open(page_image) as image:
         page.width, page.height = image.size
         visual_types = set(cfg.get("crop_filter", {}).get("visual_block_types", []))
@@ -154,6 +171,7 @@ def _crop_page_worker(args: tuple[dict[str, Any], str, dict[str, Any]]) -> dict[
 def crop_blocks(pages: list[PageRecord], output_dir: Path, cfg: dict[str, Any]) -> None:
     if not cfg["runtime"]["crop_blocks"]:
         return
+    logger = logging.getLogger(str(cfg.get("logger_name") or __name__))
     crop_workers = max(1, int(cfg["runtime"].get("crop_workers", 1)))
     jobs = [(asdict(page), str(output_dir), cfg) for page in pages]
     if crop_workers == 1 or len(jobs) <= 1:
@@ -165,7 +183,17 @@ def crop_blocks(pages: list[PageRecord], output_dir: Path, cfg: dict[str, Any]) 
             for future in as_completed(futures):
                 results.append(future.result())
 
-    pages_by_index = {_page_from_dict(payload).page_index: _page_from_dict(payload) for payload in results}
+    failures = [(payload, error) for payload, error in results if error]
+    if failures:
+        reasons = "; ".join(dict.fromkeys(error for _, error in failures))[:300]
+        logger.warning(
+            "crop_blocks 跳过 %s/%s 页（该页不裁块，其余阶段照常）：%s",
+            len(failures), len(results), reasons,
+        )
+
+    pages_by_index = {
+        _page_from_dict(payload).page_index: _page_from_dict(payload) for payload, _ in results
+    }
     for index, page in enumerate(pages):
         updated_page = pages_by_index.get(page.page_index, page)
         pages[index] = updated_page

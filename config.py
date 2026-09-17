@@ -246,6 +246,10 @@ CFG = {
         "image_format": "png",
         "max_side": 2200,
         "retry_count": 2,
+        # Pillow 的"解压炸弹"像素上限（默认 8947 万）。大幅面图纸页能到两亿多像素，
+        # 这些图是我们自己渲的、不是不可信输入，放开即可；设 None 表示不限。
+        # 注意内存：2 亿像素 RGB 约 650MB。
+        "max_image_pixels": 400000000,
         # MuPDF 的报错是 C 库直写 stderr 的，页树/xref 有瑕疵的书会逐次刷屏。
         # 关掉逐条输出，改由 render_pages 汇总成一条 WARNING。
         "silence_mupdf_errors": True,

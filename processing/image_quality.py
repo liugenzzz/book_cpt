@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -39,12 +40,47 @@ def is_valid_crop_box(width: int, height: int, cfg: dict[str, Any]) -> bool:
     return width >= min_width and height >= min_height and width * height >= min_area
 
 
+def allow_large_images(cfg: dict[str, Any]) -> None:
+    """放开 Pillow 的"解压炸弹"像素上限。
+
+    这些 PNG 是我们自己用 PyMuPDF 渲出来的，不是不可信输入，防炸弹保护不了什么；
+    但大幅面图纸页能到 2 亿多像素，超过默认的 8947 万就直接
+    DecompressionBombError，整本书跟着失败。
+    代价是内存：2 亿像素 RGB 约 650MB，所以留成可配的。
+    """
+    limit = cfg.get("render", {}).get("max_image_pixels", 400_000_000)
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return
+    if limit in (None, 0):
+        Image.MAX_IMAGE_PIXELS = None
+        return
+    current = Image.MAX_IMAGE_PIXELS
+    if current is not None and int(limit) > int(current):
+        Image.MAX_IMAGE_PIXELS = int(limit)
+
+
+def _stddev_from_histogram(histogram: list[int]) -> float:
+    """从 256 桶直方图算总体标准差。
+
+    原来用 ImageStat.Stat(gray).stddev[0]，它的方差是 sumsq - sum**2/count：
+    像素数过亿时 sum**2 超过 2^53 丢精度，结果可能是 -1e-12 这种负数，
+    math.sqrt 直接抛 ValueError("math domain error") —— 而 crop.py 没有兜底，
+    一页近均匀的大图就能让整本书失败。实测 count=107654321、均值=99 即可复现。
+
+    直方图只有 256 项，既精确又比 ImageStat 再全量扫一遍便宜。
+    """
+    total = sum(histogram)
+    if total <= 0:
+        return 0.0
+    mean = sum(value * count for value, count in enumerate(histogram)) / total
+    variance = sum(count * (value - mean) ** 2 for value, count in enumerate(histogram)) / total
+    return math.sqrt(max(0.0, variance))
+
+
 def is_meaningful_image(image: Any, cfg: dict[str, Any]) -> bool:
     if not crop_filter_enabled(cfg):
-        return True
-    try:
-        from PIL import ImageStat  # type: ignore
-    except ImportError:
         return True
 
     crop_cfg = _filter_cfg(cfg)
@@ -59,7 +95,7 @@ def is_meaningful_image(image: Any, cfg: dict[str, Any]) -> bool:
     white_pixels = sum(histogram[white_threshold:])
     blank_ratio = white_pixels / total_pixels
     non_white_ratio = 1.0 - blank_ratio
-    stddev = float(ImageStat.Stat(gray).stddev[0])
+    stddev = _stddev_from_histogram(histogram)
 
     max_blank_ratio = float(crop_cfg.get("max_blank_ratio", 0.985))
     min_non_white_ratio = float(crop_cfg.get("min_non_white_ratio", 0.005))
@@ -128,6 +164,7 @@ def _meaningful_image_file_cached(path_str: str, mtime_ns: int, size: int, cfg_r
     try:
         from PIL import Image  # type: ignore
 
+        allow_large_images(cfg_ref.cfg)
         with Image.open(path_str) as image:
             return is_meaningful_image(image, cfg_ref.cfg)
     except Exception:

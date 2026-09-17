@@ -1,7 +1,8 @@
 # book_cpt 运行依赖
 # 需要 Python >= 3.9（Ctrl-C 取消排队任务用的 shutdown(cancel_futures=True) 是 3.9 才有的）
-# 自检：python book_cpt/check_deps.py
+# 自检：python book_cpt/check_deps.py（依赖）、python book_cpt/check_pool.py（模型池探活）
 requests>=2.28        # 调 MinerU / VLM 接口，缺了直接报错
 pypdf>=4.0            # PDF 页数统计、损坏检测、去水印；watermark.enabled 默认开着，属必需
+cryptography>=3.1     # pypdf 读 AES 加密的 PDF 要用它；缺了这类书会报 "required for AES algorithm"
 PyMuPDF>=1.24         # 页面渲染成图（render_pages），缺了这一步会被静默跳过
 Pillow>=10.0          # 图像归一化、裁剪、质量检测、发给模型前的 base64 编码

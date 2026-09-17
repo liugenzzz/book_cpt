@@ -783,6 +783,7 @@ def _build_vlm_pool(cfg: dict[str, Any]) -> VlmPool:
                     "max_image_bytes": int(cfg["generation"].get("max_image_bytes", 0)),
                     "max_image_side": int(cfg["generation"].get("max_image_side", 1600)),
                     "image_jpeg_quality": int(cfg["generation"].get("image_jpeg_quality", 85)),
+                    "max_image_pixels": cfg.get("render", {}).get("max_image_pixels", 400_000_000),
                 }
             }
         },

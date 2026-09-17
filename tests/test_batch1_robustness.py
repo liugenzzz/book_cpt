@@ -350,3 +350,87 @@ class GenerationProgressLogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StddevRobustnessTests(unittest.TestCase):
+    """PIL 的 ImageStat 方差是 sumsq - sum**2/count：像素数过亿时 sum**2 超过 2^53
+    丢精度，能算出 -1e-12 这种负数，math.sqrt 抛 ValueError("math domain error")。
+    crop.py 没兜底，一页近均匀的大图就让整本书失败（实测 count=107654321、均值=99）。"""
+
+    def test_matches_pil_on_normal_images(self) -> None:
+        import random
+
+        from PIL import Image, ImageStat
+
+        from book_cpt.processing.image_quality import _stddev_from_histogram
+
+        random.seed(11)
+        for _ in range(4):
+            image = Image.new("L", (120, 120))
+            image.putdata([random.randint(0, 255) for _ in range(120 * 120)])
+            self.assertAlmostEqual(
+                _stddev_from_histogram(image.histogram()),
+                ImageStat.Stat(image).stddev[0],
+                places=9,
+            )
+
+    def test_uniform_image_is_zero_not_a_crash(self) -> None:
+        from PIL import Image
+
+        from book_cpt.processing.image_quality import _stddev_from_histogram
+
+        for color in (0, 128, 255):
+            image = Image.new("L", (40, 40), color)
+            self.assertEqual(_stddev_from_histogram(image.histogram()), 0.0)
+
+    def test_hundred_million_pixel_uniform_histogram_does_not_raise(self) -> None:
+        """直接喂一个"一亿多像素全在一个桶里"的直方图 —— 正是 PIL 会翻车的那种输入。"""
+        from book_cpt.processing.image_quality import _stddev_from_histogram
+
+        histogram = [0] * 256
+        histogram[99] = 107_654_321
+        self.assertEqual(_stddev_from_histogram(histogram), 0.0)
+
+    def test_empty_histogram_is_zero(self) -> None:
+        from book_cpt.processing.image_quality import _stddev_from_histogram
+
+        self.assertEqual(_stddev_from_histogram([0] * 256), 0.0)
+
+
+class LargeImageAllowanceTests(unittest.TestCase):
+    def test_raises_the_pillow_pixel_ceiling(self) -> None:
+        from PIL import Image
+
+        from book_cpt.processing.image_quality import allow_large_images
+
+        original = Image.MAX_IMAGE_PIXELS
+        self.addCleanup(setattr, Image, "MAX_IMAGE_PIXELS", original)
+        Image.MAX_IMAGE_PIXELS = 89_478_485
+        allow_large_images({"render": {"max_image_pixels": 400_000_000}})
+        self.assertEqual(Image.MAX_IMAGE_PIXELS, 400_000_000)
+
+    def test_never_lowers_an_already_higher_ceiling(self) -> None:
+        from PIL import Image
+
+        from book_cpt.processing.image_quality import allow_large_images
+
+        original = Image.MAX_IMAGE_PIXELS
+        self.addCleanup(setattr, Image, "MAX_IMAGE_PIXELS", original)
+        Image.MAX_IMAGE_PIXELS = 900_000_000
+        allow_large_images({"render": {"max_image_pixels": 400_000_000}})
+        self.assertEqual(Image.MAX_IMAGE_PIXELS, 900_000_000)
+
+    def test_none_means_unlimited(self) -> None:
+        from PIL import Image
+
+        from book_cpt.processing.image_quality import allow_large_images
+
+        original = Image.MAX_IMAGE_PIXELS
+        self.addCleanup(setattr, Image, "MAX_IMAGE_PIXELS", original)
+        allow_large_images({"render": {"max_image_pixels": None}})
+        self.assertIsNone(Image.MAX_IMAGE_PIXELS)
+
+    def test_shipped_config_lifts_the_default(self) -> None:
+        from book_cpt.core.config_loader import load_config
+
+        self.assertGreater(load_config()["render"]["max_image_pixels"], 89_478_485)

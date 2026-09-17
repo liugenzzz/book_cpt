@@ -11,6 +11,7 @@ import sys
 CHECKS = [
     ("requests", "requests", "必需", "调用 MinerU / VLM 接口，缺了直接报错"),
     ("pypdf", "pypdf", "必需", "PDF 页数统计、损坏检测、水印清理"),
+    ("cryptography", "cryptography", "必需", "pypdf 读 AES 加密 PDF 要用；缺了这类书会失败"),
     ("PyMuPDF", "fitz", "重要", "页面渲染成图；缺了 render_pages 会静默跳过"),
     ("Pillow", "PIL", "重要", "图像归一化 / 裁剪 / 质量检测；缺了相关步骤降级"),
 ]

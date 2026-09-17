@@ -139,3 +139,74 @@ class SilenceMupdfTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CropPageFailureIsolationTests(unittest.TestCase):
+    """单页图像出问题不该带崩整本书。
+
+    早先一页近均匀的大图会让 PIL 算出负方差、math.sqrt 抛 domain error；
+    两亿像素的大幅面图纸页会抛 DecompressionBombError。两种都会冒到
+    _process_book 的 except，整本书记成失败。
+    """
+
+    def _page(self, index: int):
+        from book_cpt.core.models import PageRecord
+
+        return PageRecord(
+            book_id="b1", book_name="b", source_pdf="x.pdf",
+            chapter_no="1", chapter_title="c", page_index=index,
+            page_label=str(index), page_image=f"images/pages/ch1/p{index:03d}.png",
+            width=0, height=0, normalized_page_path=f"normalized/ch1/p{index:03d}.json",
+        )
+
+    def _cfg(self, tmp: str) -> dict:
+        return {
+            "runtime": {"crop_blocks": True, "crop_workers": 1},
+            "crop_filter": {"enabled": True, "visual_block_types": [], "padding": 0},
+            "paths": {"block_images": "images/blocks/ch{chapter_no}/p{page_no:03d}/{block_id}_{block_type}.png"},
+            "logger_name": "book_cpt_crop_test",
+            "default_chapter_no": "1",
+        }
+
+    def test_one_bad_page_does_not_sink_the_book(self) -> None:
+        import logging
+
+        from book_cpt.processing import crop
+
+        pages = [self._page(1), self._page(2), self._page(3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+
+            def flaky(page, output_dir_text, config):
+                if page.page_index == 2:
+                    raise ValueError("math domain error")
+                return {**page.__dict__, "blocks": [], "width": 10, "height": 10}
+
+            logger = logging.getLogger("book_cpt_crop_test")
+            with patch.object(crop, "_crop_one_page", side_effect=flaky):
+                with self.assertLogs(logger, level="WARNING") as captured:
+                    crop.crop_blocks(pages, Path(tmp), cfg)
+
+        joined = "\n".join(captured.output)
+        self.assertIn("跳过 1/3 页", joined)
+        self.assertIn("math domain error", joined)
+        # 好的页面照常更新，坏的那页原样保留
+        self.assertEqual([p.width for p in pages], [10, 0, 10])
+
+    def test_all_pages_fine_logs_nothing(self) -> None:
+        import logging
+
+        from book_cpt.processing import crop
+
+        pages = [self._page(1), self._page(2)]
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+
+            def fine(page, output_dir_text, config):
+                return {**page.__dict__, "blocks": [], "width": 7, "height": 7}
+
+            logger = logging.getLogger("book_cpt_crop_test")
+            with patch.object(crop, "_crop_one_page", side_effect=fine):
+                with self.assertNoLogs(logger, level="WARNING"):
+                    crop.crop_blocks(pages, Path(tmp), cfg)
+        self.assertEqual([p.width for p in pages], [7, 7])

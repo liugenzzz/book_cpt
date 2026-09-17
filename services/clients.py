@@ -149,6 +149,10 @@ class VlmClient(RequestsClient):
             return image_bytes
         max_side = int(self.cfg.get("max_image_side") or 1600)
         quality = int(self.cfg.get("image_jpeg_quality") or 85)
+        # 大幅面图纸页能到两亿多像素，超过 Pillow 默认上限会抛 DecompressionBombError
+        limit = int(self.cfg.get("max_image_pixels") or 400_000_000)
+        if Image.MAX_IMAGE_PIXELS is not None and limit > int(Image.MAX_IMAGE_PIXELS):
+            Image.MAX_IMAGE_PIXELS = limit
         with Image.open(path) as image:
             image = image.convert("RGB")
             image.thumbnail((max_side, max_side))
