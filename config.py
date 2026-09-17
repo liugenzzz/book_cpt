@@ -321,9 +321,11 @@ CFG = {
         "providers": [
             # ---- 网关实例 ----
             {
-                "name": "Qwen3.8-27B-1",
+                # 服务端 served-model-name 实际是 Qwen3.8-Flash-Next，不是 27B；
+                # name 一并改掉，日志里才能看出是哪个模型答的。
+                "name": "Qwen3.8-Flash-Next",
                 "url": "http://jb-aionlineinferenceservice-161248564342717824-8000-nhss-job.z2120.nhss.zhejianglab.com:31080/v1/chat/completions",
-                "model": "Qwen3.8-27B",
+                "model": "Qwen3.8-Flash-Next",
                 "api_key_env": "",
                 "api_key": "624pLvSLzgNqsmZo9wmQgn_JjRVaTpmJ73IZPE8QMUg",
                 "stream": False,
