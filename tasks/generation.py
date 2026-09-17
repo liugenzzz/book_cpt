@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -346,6 +347,36 @@ def _template_input(job: SampleJob, cfg: dict[str, Any]) -> dict[str, Any]:
     return {"page_image": job.images[0] if job.images else job.page.page_image}
 
 
+def _context_blocks(
+    blocks: list[Any],
+    cfg: dict[str, Any],
+    *,
+    max_blocks: int | None = None,
+    max_chars: int | None = None,
+) -> list[dict[str, Any]]:
+    """把版面块裁到有上限的形状。
+
+    原来 layout_blocks 和 page_window[].blocks 都是整页块原样 asdict，完全没有
+    条数和长度上限。稠密书页几十个块、每块 text 和 markdown 各几百字，再乘上
+    chapter_window=6 页，实测 context 能到 40 万字符 ≈ 27 万 token，加上
+    max_tokens=32768 远超服务端 max_model_len=131072，请求被 HTTP 400 打回 ——
+    chapter_key_conclusions 这类宽窗口任务在所有实例上全军覆没就是这么来的。
+    """
+    generation_cfg = cfg["generation"]
+    limit_blocks = max_blocks if max_blocks is not None else int(generation_cfg.get("max_context_blocks", 40))
+    limit_chars = max_chars if max_chars is not None else int(generation_cfg.get("max_context_block_chars", 600))
+    rows: list[dict[str, Any]] = []
+    for block in blocks[:limit_blocks]:
+        row = dict(block) if isinstance(block, dict) else asdict(block)
+        text = truncate_text(str(row.get("text") or ""), limit_chars)
+        markdown = truncate_text(str(row.get("markdown") or ""), limit_chars)
+        row["text"] = text
+        # markdown 去掉空白后与 text 一致时不再重复发一份，能省掉近一半体积
+        row["markdown"] = "" if clean_text(markdown) == clean_text(text) else markdown
+        rows.append(row)
+    return rows
+
+
 def _model_context(job: SampleJob, cfg: dict[str, Any]) -> dict[str, Any]:
     max_page_chars = int(cfg["generation"]["max_page_context_chars"])
     max_neighbor_chars = int(cfg["generation"]["max_neighbor_context_chars"])
@@ -354,18 +385,86 @@ def _model_context(job: SampleJob, cfg: dict[str, Any]) -> dict[str, Any]:
             "page_index": page.page_index,
             "page_image": page.page_image,
             "full_text": truncate_text(page.full_text, max_neighbor_chars),
-            "blocks": [asdict(block) for block in page.blocks],
+            # 邻页单独给一套更紧的上限：它主要靠 full_text 提供上下文，
+            # 块明细乘上窗口页数才是爆量的主因（chapter_window=6 时占 33 万字符）。
+            "blocks": _context_blocks(
+                page.blocks,
+                cfg,
+                max_blocks=int(cfg["generation"].get("max_window_context_blocks", 12)),
+                max_chars=int(cfg["generation"].get("max_window_context_block_chars", 300)),
+            ),
         }
         for page in job.page_window
     ]
     return {
         "template_input": _template_input(job, cfg),
         "page_ocr": truncate_text(job.page.full_text, max_page_chars),
-        "layout_blocks": [asdict(block) for block in job.page.blocks],
+        "layout_blocks": _context_blocks(job.page.blocks, cfg),
         "block": asdict(job.block) if job.block else {},
         "page_window": page_window,
         "source": job.source,
     }
+
+
+def _shrink_context(payload: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, str]:
+    """序列化 payload；超出 max_prompt_chars 就逐级瘦身，返回 (json 文本, 采取的措施)。
+
+    最后一道保险：上面的上限已经覆盖了已知的爆量路径，但数据形状千奇百怪，
+    宁可少发一些上下文，也不要整条请求被 400 打回、一条样本都拿不到。
+    只做结构化瘦身、不截断最终字符串 —— 截断会把 prompt 里的 JSON 弄成残缺的。
+    """
+    budget = int(cfg["generation"].get("max_prompt_chars", 0) or 0)
+    dumped = json.dumps(payload, ensure_ascii=False, indent=2)
+    if budget <= 0 or len(dumped) <= budget:
+        return dumped, ""
+
+    context = payload.get("context")
+    if not isinstance(context, dict):
+        return dumped, ""
+    window = context.get("page_window")
+    steps: list[str] = []
+
+    def reserialize() -> str:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # 1) 邻页的版面块最先砍：邻页主要靠 full_text 提供上下文
+    if isinstance(window, list) and any(item.get("blocks") for item in window if isinstance(item, dict)):
+        for item in window:
+            if isinstance(item, dict):
+                item["blocks"] = []
+        steps.append("清空邻页 blocks")
+        dumped = reserialize()
+        if len(dumped) <= budget:
+            return dumped, "；".join(steps)
+
+    # 2) 本页版面块减半
+    layout = context.get("layout_blocks")
+    if isinstance(layout, list) and layout:
+        context["layout_blocks"] = _context_blocks(
+            layout, cfg, max_blocks=max(1, len(layout) // 2), max_chars=200
+        )
+        steps.append("本页 blocks 减半并截到 200 字")
+        dumped = reserialize()
+        if len(dumped) <= budget:
+            return dumped, "；".join(steps)
+
+    # 3) 邻页正文压到 1200 字
+    if isinstance(window, list):
+        for item in window:
+            if isinstance(item, dict):
+                item["full_text"] = truncate_text(str(item.get("full_text") or ""), 1200)
+        steps.append("邻页正文压到 1200 字")
+        dumped = reserialize()
+        if len(dumped) <= budget:
+            return dumped, "；".join(steps)
+
+    # 4) 还超就丢掉本页版面块
+    if context.get("layout_blocks"):
+        context["layout_blocks"] = []
+        steps.append("丢掉本页 blocks")
+        dumped = reserialize()
+
+    return dumped, "；".join(steps)
 
 
 def _prompt(job: SampleJob, cfg: dict[str, Any]) -> str:
@@ -393,13 +492,23 @@ def _prompt(job: SampleJob, cfg: dict[str, Any]) -> str:
         "context": _model_context(job, cfg),
         "expected_count": cfg["generation"]["samples_per_job"].get(job.task_type, 1),
     }
+    context_json, shrunk = _shrink_context(payload, cfg)
+    if shrunk:
+        logging.getLogger(str(cfg.get("logger_name") or __name__)).warning(
+            "prompt 超出 max_prompt_chars，已瘦身 task_type=%s book_id=%s page=%s 措施=%s 结果=%s字符",
+            job.task_type,
+            getattr(job.book, "book_id", ""),
+            getattr(job.page, "page_index", ""),
+            shrunk,
+            len(context_json),
+        )
     prompt = str(cfg["prompts"][job.task_type]).strip()
     template_rule = (
         "请严格按 task_template.md 的任务模板生成样本："
         "instruction 必须由大模型根据当前输入证据生成，表达要多样化，不能复制固定模板句；"
         "输出 JSON 对象中除 instruction 和证据字段外，只保留 output_fields 指定字段。"
     )
-    return f"{prompt}\n\n{template_rule}\n\n{JSON_OUTPUT_INSTRUCTION}\n\nInput JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    return f"{prompt}\n\n{template_rule}\n\n{JSON_OUTPUT_INSTRUCTION}\n\nInput JSON:\n{context_json}"
 
 
 def _normalize_instruction(raw: Any, task_type: str, sample_no: int) -> str:

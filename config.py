@@ -723,6 +723,22 @@ CFG = {
         "max_block_context_chars": 3600,
         "max_neighbor_context_chars": 5000,
         "max_pt_context_chars": 9000,
+        # 版面块上限。原来 layout_blocks 和 page_window[].blocks 都是整页块原样塞进去、
+        # 没有条数和长度上限，稠密书页 × chapter_window=6 能让 context 到 40 万字符
+        # ≈ 27 万 token，远超服务端 max_model_len，请求直接被 400 打回。
+        "max_context_blocks": 40,
+        "max_context_block_chars": 600,
+        # 邻页（page_window）的块另给一套更紧的上限：邻页主要靠 full_text 提供上下文，
+        # 块明细乘上窗口页数才是爆量主因。
+        "max_window_context_blocks": 12,
+        "max_window_context_block_chars": 300,
+        # 最后一道保险：拼好的 Input JSON 超过这个长度就逐级瘦身（先砍邻页块，
+        # 再减半本页块……）。加了上面的块上限之后，chapter_window=6 的稠密页实测
+        # 12.7 万字符，本来就能过；这里取 13.5 万，让保险丝只管病态情况，
+        # 不要每个任务都响、把日志刷满。
+        #   13.5 万字符 ÷ 1.5 字/token ≈ 9 万 token + max_tokens 32768 = 12.3 万
+        #   < max_model_len 131072，还剩 8 千 token 余量（1.5 已是偏悲观的估法）。
+        "max_prompt_chars": 135000,
         "max_image_bytes": 2097152,
         "max_image_side": 1600,
         "image_jpeg_quality": 85,

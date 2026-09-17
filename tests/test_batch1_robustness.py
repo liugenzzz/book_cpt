@@ -434,3 +434,114 @@ class LargeImageAllowanceTests(unittest.TestCase):
         from book_cpt.core.config_loader import load_config
 
         self.assertGreater(load_config()["render"]["max_image_pixels"], 89_478_485)
+
+
+class ContextSizeBoundTests(unittest.TestCase):
+    """layout_blocks 和 page_window[].blocks 原来是整页块原样 asdict，
+    没有条数和长度上限。稠密书页 × chapter_window=6 实测 context 到 40 万字符
+    ≈ 27 万 token，加上 max_tokens=32768 远超 max_model_len=131072，
+    请求被 HTTP 400 打回 —— chapter_key_conclusions 在所有实例上全军覆没。"""
+
+    def _job(self, *, blocks_per_page: int, window: int, block_chars: int = 420):
+        from book_cpt.core.models import BlockRecord, BookRecord, PageRecord, SampleJob
+
+        unit = "航空发动机压气机叶片在高转速下承受离心载荷与气动载荷的联合作用。"
+
+        def blocks():
+            return [
+                BlockRecord(
+                    block_id=f"b{i}", block_type="text", bbox=[10.5, 20.5, 500.25, 80.75],
+                    text=unit * (block_chars // 30), markdown=unit * (block_chars // 30),
+                    reading_order=i, confidence=0.93,
+                )
+                for i in range(blocks_per_page)
+            ]
+
+        def page(index: int):
+            return PageRecord(
+                book_id="b1", book_name="书", source_pdf="x.pdf", chapter_no="3",
+                chapter_title="第三章", page_index=index, page_label=str(index),
+                page_image=f"images/pages/ch3/p{index:03d}.png", width=2000, height=3000,
+                blocks=blocks(), full_text="正文内容" * 1500,
+                normalized_page_path=f"normalized/ch3/p{index:03d}.json",
+            )
+
+        book = BookRecord(
+            book_id="b1", book_name="书", source_pdf="x.pdf", output_dir="/tmp/o",
+            page_count=600, file_size=1, file_hash="h", status="ready",
+            created_at="t", pipeline_version="book_prompt_v1",
+        )
+        return SampleJob(
+            task_type="chapter_key_conclusions", book=book, page=page(10),
+            page_window=[page(i) for i in range(window)],
+        )
+
+    def _fits(self, prompt: str, *, max_tokens: int = 32768, max_model_len: int = 131072) -> bool:
+        # 中文约 1.5 字/token，偏悲观的估法
+        return len(prompt) / 1.5 + max_tokens < max_model_len
+
+    def test_dense_page_with_configured_window_fits(self) -> None:
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.tasks.generation import _prompt
+
+        cfg = load_config()
+        window = int(cfg["routing"]["chapter_window"])
+        prompt = _prompt(self._job(blocks_per_page=40, window=window), cfg)
+        self.assertTrue(self._fits(prompt), f"{len(prompt)} 字符仍然超预算")
+
+    def test_pathological_page_still_fits_via_the_safety_net(self) -> None:
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.tasks.generation import _prompt
+
+        cfg = load_config()
+        prompt = _prompt(self._job(blocks_per_page=200, window=16), cfg)
+        self.assertTrue(self._fits(prompt), f"{len(prompt)} 字符仍然超预算")
+
+    def test_block_count_and_chars_are_capped(self) -> None:
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.tasks.generation import _context_blocks
+
+        cfg = load_config()
+        job = self._job(blocks_per_page=200, window=1)
+        rows = _context_blocks(job.page.blocks, cfg)
+        self.assertEqual(len(rows), cfg["generation"]["max_context_blocks"])
+        for row in rows:
+            self.assertLessEqual(len(row["text"]), cfg["generation"]["max_context_block_chars"] + 3)
+
+    def test_markdown_identical_to_text_is_dropped(self) -> None:
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.tasks.generation import _context_blocks
+
+        job = self._job(blocks_per_page=3, window=1)
+        rows = _context_blocks(job.page.blocks, load_config())
+        self.assertTrue(all(row["markdown"] == "" for row in rows), "markdown 与 text 相同时不该重复发")
+
+    def test_differing_markdown_is_kept(self) -> None:
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.core.models import BlockRecord
+        from book_cpt.tasks.generation import _context_blocks
+
+        block = BlockRecord(block_id="b", block_type="table", text="纯文本", markdown="| 表 | 头 |")
+        rows = _context_blocks([block], load_config())
+        self.assertEqual(rows[0]["markdown"], "| 表 | 头 |")
+
+    def test_safety_net_reports_what_it_did(self) -> None:
+        from copy import deepcopy
+
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.tasks.generation import _model_context, _shrink_context
+
+        cfg = deepcopy(load_config())
+        cfg["generation"]["max_prompt_chars"] = 5000
+        job = self._job(blocks_per_page=40, window=6)
+        _, steps = _shrink_context({"context": _model_context(job, cfg)}, cfg)
+        self.assertIn("邻页", steps)
+
+    def test_safety_net_silent_when_under_budget(self) -> None:
+        from book_cpt.core.config_loader import load_config
+        from book_cpt.tasks.generation import _model_context, _shrink_context
+
+        cfg = load_config()
+        job = self._job(blocks_per_page=5, window=1, block_chars=60)
+        _, steps = _shrink_context({"context": _model_context(job, cfg)}, cfg)
+        self.assertEqual(steps, "")
