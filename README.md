@@ -234,11 +234,18 @@ python app\cli.py --input-dir book_cpt\data --output-root book_cpt\outputs --boo
 - JSON 修复：容忍字符串里的真实换行、补转义非法反斜杠（LaTeX 的 `\alpha`、`\%` 之类）、
   去掉尾随逗号、`expected_count=1` 时模型返回单个对象而不是数组也能收下。
 
-依赖自检：
+自检：
 
 ```powershell
-python book_cpt\check_deps.py
+python book_cpt\check_deps.py     # Python 版本 + 依赖包
+python book_cpt\check_pool.py     # 模型池探活：逐个打 VLM 和 MinerU 实例
 ```
+
+`check_pool.py` 并发探测 `config.py` 里每个 enabled 的 VLM 实例（`GET /v1/models`，
+顺带核对 `model` 名跟服务端 `served-model-name` 对不对得上）和每个 MinerU 实例
+（`GET /docs`，以及 `vlm-http-client` 后端真正干活的 `server_url`）。
+全通返回 0，有任何一个不通返回 1，可以直接串在启动脚本前面。
+`--chat` 会额外发一次真实 chat 请求（更慢更准），`--all` 连 `enabled=False` 的也探。
 
 ## 输出
 

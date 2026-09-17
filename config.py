@@ -195,7 +195,12 @@ CFG = {
         # 与 journal_cpt 对齐：16 个书籍进程 × 每进程 16 路生成 = 256 路，
         # 正好等于 16 个 VLM 实例 × 16 槽位；摊薄后每个进程在每个实例上占 1 槽。
         "book_workers": 16,
-        "max_workers": 16,
+        # 配套 vLLM 侧 --max-num-seqs=24。摊薄是整除，book_workers=16 时单实例上限
+        # 只能是 16 的倍数，所以声明 32（见 vlm_pool.providers.max_concurrency）：
+        #   32 // 16 = 2 槽/进程  ->  单实例 2 × 16 = 32 路
+        # 22 个可用实例 × 每进程 2 槽 = 44 槽/进程 -> 16 × 44 = 704 在飞 = 22 × 32。
+        # 对服务端 24 是 1.33 倍轻度超发：多出来的排在 vLLM 队列里，保证 batch 不空转。
+        "max_workers": 44,
         # 页面渲染是 CPU/磁盘密集，跟 16 个进程叠乘，这里压到 2。
         "page_workers": 2,
         "crop_workers": 4,
@@ -312,7 +317,7 @@ CFG = {
     "vlm_pool": {
         "strategy": "least_busy_weighted_fallback",
         "fallback": {"enabled": True, "max_attempts": 2, "cooldown_seconds": 300},
-        # enabled=False 的实例保留在表里当档案，调度时会被跳过；恢复可用时删掉那一行即可。
+        # enabled=False 的实例保留当档案，调度时跳过；恢复可用时删掉那一行即可。
         "providers": [
             # ---- 网关实例 ----
             {
@@ -329,7 +334,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.5-122B-A10B",
@@ -345,7 +350,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 2,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 # 暂时不能用
@@ -362,7 +367,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 3,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-2",
@@ -377,9 +382,9 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 3,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
-            # ---- 10.107.231.26（暂停/空闲）----
+            # ---- 10.107.231.26 ----
             {
                 "name": "Qwen3.8-27B-26-8001",
                 "url": "http://10.107.231.26:8001/v1/chat/completions",
@@ -393,7 +398,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-26-8002",
@@ -408,7 +413,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-26-8003",
@@ -423,7 +428,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 # 暂停
@@ -440,9 +445,9 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
-            # ---- 10.107.234.43（书籍）----
+            # ---- 10.107.234.43 ----
             {
                 "name": "Qwen3.8-27B-43-8001",
                 "url": "http://10.107.234.43:8001/v1/chat/completions",
@@ -456,7 +461,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-43-8002",
@@ -471,7 +476,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-43-8003",
@@ -486,7 +491,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-43-8004",
@@ -501,12 +506,12 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
-            # ---- 10.200.100.103（书籍）----
+            # ---- 10.107.231.28 ----
             {
-                "name": "Qwen3.8-27B-103-8001",
-                "url": "http://10.200.100.103:8001/v1/chat/completions",
+                "name": "Qwen3.8-27B-28-8001",
+                "url": "http://10.107.231.28:8001/v1/chat/completions",
                 "model": "Qwen3.8-27B",
                 "api_key": "local-pool-key",
                 "stream": False,
@@ -517,11 +522,11 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
-                "name": "Qwen3.8-27B-103-8002",
-                "url": "http://10.200.100.103:8002/v1/chat/completions",
+                "name": "Qwen3.8-27B-28-8002",
+                "url": "http://10.107.231.28:8002/v1/chat/completions",
                 "model": "Qwen3.8-27B",
                 "api_key": "local-pool-key",
                 "stream": False,
@@ -532,11 +537,11 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
-                "name": "Qwen3.8-27B-103-8003",
-                "url": "http://10.200.100.103:8003/v1/chat/completions",
+                "name": "Qwen3.8-27B-28-8003",
+                "url": "http://10.107.231.28:8003/v1/chat/completions",
                 "model": "Qwen3.8-27B",
                 "api_key": "local-pool-key",
                 "stream": False,
@@ -547,11 +552,11 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
-                "name": "Qwen3.8-27B-103-8004",
-                "url": "http://10.200.100.103:8004/v1/chat/completions",
+                "name": "Qwen3.8-27B-28-8004",
+                "url": "http://10.107.231.28:8004/v1/chat/completions",
                 "model": "Qwen3.8-27B",
                 "api_key": "local-pool-key",
                 "stream": False,
@@ -562,9 +567,9 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
-            # ---- 10.107.238.7（书籍）----
+            # ---- 10.107.238.7 ----
             {
                 "name": "Qwen3.8-27B-7-8001",
                 "url": "http://10.107.238.7:8001/v1/chat/completions",
@@ -578,7 +583,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-7-8002",
@@ -593,7 +598,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-7-8003",
@@ -608,7 +613,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-7-8004",
@@ -623,70 +628,9 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
-            # ---- 10.107.234.47（书籍）----
-            {
-                "name": "Qwen3.8-27B-47-8001",
-                "url": "http://10.107.234.47:8001/v1/chat/completions",
-                "model": "Qwen3.8-27B",
-                "api_key": "local-pool-key",
-                "stream": False,
-                "temperature": 0.6,
-                "max_tokens": 32768,
-                "timeout": 2400,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 1,
-                "max_concurrency": 16,
-            },
-            {
-                "name": "Qwen3.8-27B-47-8002",
-                "url": "http://10.107.234.47:8002/v1/chat/completions",
-                "model": "Qwen3.8-27B",
-                "api_key": "local-pool-key",
-                "stream": False,
-                "temperature": 0.6,
-                "max_tokens": 32768,
-                "timeout": 2400,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 1,
-                "max_concurrency": 16,
-            },
-            {
-                "name": "Qwen3.8-27B-47-8003",
-                "url": "http://10.107.234.47:8003/v1/chat/completions",
-                "model": "Qwen3.8-27B",
-                "api_key": "local-pool-key",
-                "stream": False,
-                "temperature": 0.6,
-                "max_tokens": 32768,
-                "timeout": 2400,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 1,
-                "max_concurrency": 16,
-            },
-            {
-                "name": "Qwen3.8-27B-47-8004",
-                "url": "http://10.107.234.47:8004/v1/chat/completions",
-                "model": "Qwen3.8-27B",
-                "api_key": "local-pool-key",
-                "stream": False,
-                "temperature": 0.6,
-                "max_tokens": 32768,
-                "timeout": 2400,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 1,
-                "max_concurrency": 16,
-            },
-            # ---- 10.107.226.31（空闲）----
+            # ---- 10.107.226.31 ----
             {
                 "name": "Qwen3.8-27B-31-8001",
                 "url": "http://10.107.226.31:8001/v1/chat/completions",
@@ -700,7 +644,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-31-8002",
@@ -715,7 +659,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-31-8003",
@@ -730,7 +674,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
             {
                 "name": "Qwen3.8-27B-31-8004",
@@ -745,7 +689,7 @@ CFG = {
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 1,
-                "max_concurrency": 16,
+                "max_concurrency": 32,
             },
         ],
     },
